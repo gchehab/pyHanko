@@ -12,6 +12,7 @@ import uuid
 from binascii import hexlify
 from fractions import Fraction
 from typing import Optional
+from numbers import Rational
 
 import qrcode
 import tzlocal
@@ -241,7 +242,7 @@ class TextStamp(PdfContent):
             # text boxes do not auto-scale their font size, so
             # we have to take care of that
             box = BoxConstraints(
-                aspect_ratio=Fraction(expected_w, expected_h)
+                aspect_ratio=Fraction(int(expected_w), int(expected_h))
             )
 
         self.text_box = TextBox(
