@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+.vscode/
+pyhanko.yml
 __pycache__/
 *.py[cod]
 *$py.class
