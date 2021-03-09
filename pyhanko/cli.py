@@ -582,27 +582,35 @@ def generic_sign(*, writer, outfile, signature_meta, signer, timestamper,
               help='file(s) containing the chain of trust for the '
                    'signer\'s certificate (PEM/DER). May be '
                    'passed multiple times.')
+@click.option('--nopassphrase', required=False, is_flag = True, default = False,
+              help='do not ask for passphrase (less secure private key,'
+                   ' avoid whenever possible)')
 # TODO allow reading the passphrase from a specific file descriptor
 #  (for advanced scripting setups)
 @click.option('--passfile', help='file containing the passphrase '
               'for the private key', required=False, type=click.File('rb'),
               show_default='stdin')
 @click.pass_context
-def addsig_pemder(ctx, infile, outfile, key, cert, chain, passfile):
+def addsig_pemder(ctx, infile, outfile, key, cert, chain, passfile, nopassphrase):
     signature_meta = ctx.obj[Ctx.SIG_META]
     existing_fields_only = ctx.obj[Ctx.EXISTING_ONLY]
     timestamp_url = ctx.obj[Ctx.TIMESTAMP_URL]
 
-    if passfile is None:
-        passphrase = getpass.getpass(prompt='Key passphrase: ').encode('utf-8')
+    if not nopassphrase:
+        if passfile is None:
+            passphrase = getpass.getpass(prompt='Key passphrase: ').encode('utf-8')
+        else:
+            passphrase = passfile.read()
+            passfile.close()
+        signer = signers.SimpleSigner.load(
+            cert_file=cert, key_file=key, key_passphrase=passphrase,
+            ca_chain_files=chain, prefer_pss=ctx.obj[Ctx.PREFER_PSS]
+        )
     else:
-        passphrase = passfile.read()
-        passfile.close()
-    
-    signer = signers.SimpleSigner.load(
-        cert_file=cert, key_file=key, key_passphrase=passphrase,
-        ca_chain_files=chain, prefer_pss=ctx.obj[Ctx.PREFER_PSS]
-    )
+        signer = signers.SimpleSigner.load(
+            cert_file=cert, key_file=key,
+            ca_chain_files=chain, prefer_pss=ctx.obj[Ctx.PREFER_PSS]
+        )
     return addsig_simple_signer(
         signer, infile, outfile, timestamp_url=timestamp_url,
         signature_meta=signature_meta,
