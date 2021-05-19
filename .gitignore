@@ -115,5 +115,5 @@ celerybeat.pid
 # ignore wordlists
 dictionaries/
 *.pdf
-
+*.otf
 testdata/
