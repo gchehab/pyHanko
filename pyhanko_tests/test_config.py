@@ -1,7 +1,10 @@
+from datetime import timedelta
+
 import pytest
 
 from pyhanko import config, stamp
-from pyhanko.config import StdLogOutput, DEFAULT_ROOT_LOGGER_LEVEL
+from pyhanko.config import StdLogOutput, DEFAULT_ROOT_LOGGER_LEVEL, \
+    DEFAULT_TIME_TOLERANCE, init_validation_context_kwargs
 from pyhanko.pdf_utils.config_utils import ConfigurationError
 from pyhanko.pdf_utils.images import PdfImage
 from pyhanko.stamp import QRStampStyle, TextStampStyle
@@ -13,9 +16,9 @@ def test_read_vc_kwargs(trust_replace):
     config_string = f"""
     validation-contexts:
         default:
-            trust: '{TESTING_CA_DIR}/root/certs/ca.cert.pem'
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
             trust-replace: {'true' if trust_replace else 'false'}
-            other-certs: '{TESTING_CA_DIR}/intermediate/certs/ca-chain.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
     """
     cli_config: config.CLIConfig = config.parse_cli_config(config_string)
     vc_kwargs = cli_config.get_validation_context(as_dict=True)
@@ -26,6 +29,10 @@ def test_read_vc_kwargs(trust_replace):
     else:
         assert 'trust_roots' not in vc_kwargs
         assert len(vc_kwargs['extra_trust_roots']) == 1
+
+    ku = cli_config.get_signer_key_usages()
+    assert ku.key_usage is None
+    assert ku.extd_key_usage is None
 
     with pytest.raises(ConfigurationError):
         cli_config.get_validation_context('theresnosuchvc')
@@ -206,3 +213,255 @@ WRONG_CONFIGS = [
 def test_read_logging_config_errors(config_str):
     with pytest.raises(ConfigurationError):
         config.parse_cli_config(config_str)
+
+
+@pytest.mark.parametrize('key_usage_str, key_usages', [
+    ('non_repudiation', {'non_repudiation'}),
+    ('[non_repudiation, digital_signature]',
+     {'non_repudiation', 'digital_signature'}),
+    ('[]', set()),
+])
+def test_read_key_usage(key_usage_str, key_usages):
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-key-usage: {key_usage_str}
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    key_usage_settings = cli_config.get_signer_key_usages()
+    assert key_usage_settings.key_usage == key_usages
+    assert key_usage_settings.extd_key_usage is None
+
+
+@pytest.mark.parametrize('key_usage_str, key_usages', [
+    ('piv_content_signing', {'piv_content_signing'}),
+    ('[piv_content_signing, code_signing]',
+     {'piv_content_signing', 'code_signing'}),
+    ('[]', set()),
+    ('[2.16.840.1.101.3.6.7, code_signing]',
+     {'piv_content_signing', 'code_signing'}),
+    ('[2.16.840.1.101.3.6.7, "2.999"]',
+     {'piv_content_signing', '2.999'}),
+    ('2.16.840.1.101.3.6.7', {'piv_content_signing'}),
+    ('"2.999"', {'2.999'}),
+])
+def test_read_extd_key_usage(key_usage_str, key_usages):
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-extd-key-usage: {key_usage_str}
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    key_usage_settings = cli_config.get_signer_key_usages()
+    assert key_usage_settings.key_usage is None
+    assert key_usage_settings.extd_key_usage == key_usages
+    assert not key_usage_settings.match_all_key_usages
+
+
+def test_read_key_usage_policy_1():
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-key-usage-policy:
+                key-usage: [digital_signature, non_repudiation]
+                match-all-key-usages: true
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    key_usage_settings = cli_config.get_signer_key_usages()
+    assert key_usage_settings.key_usage \
+           == {'digital_signature', 'non_repudiation'}
+    assert key_usage_settings.key_usage_forbidden is None
+    assert key_usage_settings.extd_key_usage is None
+    assert key_usage_settings.match_all_key_usages
+
+
+def test_read_key_usage_policy_2():
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-key-usage-policy:
+                key-usage: [digital_signature, non_repudiation]
+                extd-key-usage: '2.999'
+                explicit-extd-key-usage-required: true
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    key_usage_settings = cli_config.get_signer_key_usages()
+    assert key_usage_settings.key_usage \
+           == {'digital_signature', 'non_repudiation'}
+    assert key_usage_settings.extd_key_usage == {'2.999'}
+    assert key_usage_settings.explicit_extd_key_usage_required
+
+
+def test_read_key_usage_policy_3():
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-key-usage-policy:
+                key-usage: [digital_signature, non_repudiation]
+                key-usage-forbidden: data_encipherment
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    key_usage_settings = cli_config.get_signer_key_usages()
+    assert key_usage_settings.key_usage \
+           == {'digital_signature', 'non_repudiation'}
+    assert key_usage_settings.key_usage_forbidden == {'data_encipherment'}
+    assert key_usage_settings.extd_key_usage is None
+    assert not key_usage_settings.match_all_key_usages
+
+
+@pytest.mark.parametrize('key_usage_str', [
+    '0', '["non_repudiation", 2]', "[1, 2, 3]", "abcdef",
+    '["no_such_key_usage"]',
+])
+def test_extd_key_usage_errors(key_usage_str):
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-extd-key-usage: {key_usage_str}
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    with pytest.raises(ConfigurationError):
+        cli_config.get_signer_key_usages()
+
+
+@pytest.mark.parametrize('key_usage_str', [
+    '0', '["non_repudiation", 2]', "[1, 2, 3]", "abcdef",
+    '["no_such_key_usage"]',
+])
+def test_key_usage_errors(key_usage_str):
+    config_string = f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            signer-key-usage: {key_usage_str}
+    """
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    with pytest.raises(ConfigurationError):
+        cli_config.get_signer_key_usages()
+
+
+@pytest.mark.parametrize('config_string, result', [
+    (f"""
+    time-tolerance: 5
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, 5),
+    (f"""
+    time-tolerance: 5
+    validation-contexts:
+        default:
+            time-tolerance: 7
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, 7),
+    (f"""
+    validation-contexts:
+        default:
+            time-tolerance: 7
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, 7),
+
+    (f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, DEFAULT_TIME_TOLERANCE)
+])
+def test_read_time_tolerance(config_string, result):
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    vc_kwargs = cli_config.get_validation_context(as_dict=True)
+    assert vc_kwargs['time_tolerance'] == timedelta(seconds=result)
+
+
+def test_read_time_tolerance_input_issues():
+    config_string = f"""
+    validation-contexts:
+        default:
+            time-tolerance: "this makes no sense"
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+    """
+    with pytest.raises(ConfigurationError, match='time-tolerance.*'):
+        cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+        cli_config.get_validation_context(as_dict=True)
+
+    config_string = f"""
+    time-tolerance: "this makes no sense"
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+    """
+    with pytest.raises(ConfigurationError, match='time-tolerance.*'):
+        cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+        cli_config.get_validation_context(as_dict=True)
+
+    vc_kwargs = init_validation_context_kwargs(
+        trust=[], trust_replace=False, other_certs=[]
+    )
+    assert 'retroactive_revinfo' not in vc_kwargs
+    assert vc_kwargs['time_tolerance'] == timedelta(
+        seconds=DEFAULT_TIME_TOLERANCE
+    )
+
+
+@pytest.mark.parametrize('config_string, result', [
+    (f"""
+    retroactive-revinfo: true
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, True),
+    (f"""
+    retroactive-revinfo: true
+    validation-contexts:
+        default:
+            retroactive-revinfo: false
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, False),
+    (f"""
+    retroactive-revinfo: false
+    validation-contexts:
+        default:
+            retroactive-revinfo: true
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, True),
+    (f"""
+    validation-contexts:
+        default:
+            retroactive-revinfo: true
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, True),
+    (f"""
+    validation-contexts:
+        default:
+            retroactive-revinfo: "yes"
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, True),
+    (f"""
+    validation-contexts:
+        default:
+            trust: '{TESTING_CA_DIR}/root/root.cert.pem'
+            other-certs: '{TESTING_CA_DIR}/ca-chain.cert.pem'
+    """, False)
+])
+def test_read_retroactive_revinfo(config_string, result):
+    cli_config: config.CLIConfig = config.parse_cli_config(config_string)
+    vc_kwargs = cli_config.get_validation_context(as_dict=True)
+    if result is False:
+        assert 'retroactive_revinfo' not in vc_kwargs
+    else:
+        assert vc_kwargs['retroactive_revinfo']

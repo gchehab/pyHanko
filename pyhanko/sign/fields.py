@@ -9,8 +9,11 @@ from typing import List, Optional, Union, Set
 
 from asn1crypto import x509
 from asn1crypto.x509 import KeyUsage
-from certvalidator import InvalidCertificateError
-from certvalidator.path import ValidationPath
+
+from pyhanko.pdf_utils.content import RawContent
+from pyhanko.pdf_utils.layout import BoxConstraints
+from pyhanko_certvalidator import InvalidCertificateError
+from pyhanko_certvalidator.path import ValidationPath
 
 from pyhanko.pdf_utils import generic
 from pyhanko.pdf_utils.generic import pdf_name, pdf_string
@@ -606,7 +609,9 @@ class SigCertConstraints:
                 try:
                     KeyUsageConstraints(
                         key_usage=ku.must_have_set(),
-                        key_usage_forbidden=ku.forbidden_set()
+                        key_usage_forbidden=ku.forbidden_set(),
+                        # This is the way ISO 32k does things
+                        match_all_key_usages=True
                     ).validate(signer)
                     break
                 except InvalidCertificateError:
@@ -1148,6 +1153,10 @@ class SigFieldSpec:
     box: (int, int, int, int) = None
     """
     Bounding box of the signature field, if applicable.
+
+    Typically specified in ``ll_x``, ``ll_y``, ``ur_x``, ``ur_y`` format,
+    where ``ll_*`` refers to the lower left and ``ur_*`` to the upper right
+    corner.
     """
 
     seed_value_dict: SigSeedValueSpec = None
@@ -1234,10 +1243,24 @@ def _insert_or_get_field_at(writer: BasePdfFileWriter, fields, path,
     )
 
 
+def _ensure_sig_flags(writer, lock_sig_flags: bool = True):
+    # make sure /SigFlags is present. If not, create it
+    # 3 = use append-only mode
+
+    form = writer.root['/AcroForm']
+
+    if lock_sig_flags:
+        orig_sig_flags = form.get('/SigFlags', None)
+        form['/SigFlags'] = generic.NumberObject(3)
+        if orig_sig_flags != 3:
+            writer.update_container(form)
+    else:
+        form.setdefault(pdf_name('/SigFlags'), generic.NumberObject(1))
+
+
 def _prepare_sig_field(sig_field_name, root,
                        update_writer: BasePdfFileWriter,
-                       existing_fields_only=False, lock_sig_flags=True,
-                       **kwargs):
+                       existing_fields_only=False, **kwargs):
     """
     Returns a tuple of a boolean and a reference to a signature field.
     The boolean is ``True`` if the field was created, and ``False`` otherwise.
@@ -1298,9 +1321,6 @@ def _prepare_sig_field(sig_field_name, root,
     )
     sig_field.register_widget_annotation(update_writer, sig_field_ref)
 
-    # make sure /SigFlags is present. If not, create it
-    sig_flags = 3 if lock_sig_flags else 1
-    form.setdefault(pdf_name('/SigFlags'), generic.NumberObject(sig_flags))
     # if a field was added to an existing form, register an extra update
     if not form_created:
         update_writer.update_container(fields)
@@ -1416,13 +1436,13 @@ def append_signature_field(pdf_out: BasePdfFileWriter,
     root = pdf_out.root
 
     page_ref = pdf_out.find_page_for_modification(sig_field_spec.on_page)[0]
-    # use default appearance
     field_created, sig_field_ref = _prepare_sig_field(
         sig_field_spec.sig_field_name, root, update_writer=pdf_out,
-        existing_fields_only=False, lock_sig_flags=False,
+        existing_fields_only=False,
         box=sig_field_spec.box, include_on_page=page_ref,
         combine_annotation=sig_field_spec.combine_annotation
     )
+    _ensure_sig_flags(writer=pdf_out, lock_sig_flags=False)
     if not field_created:
         raise PdfWriteError(
             'Signature field with name %s already exists.'
@@ -1436,6 +1456,26 @@ def append_signature_field(pdf_out: BasePdfFileWriter,
             sig_field_spec.seed_value_dict.as_pdf_object()
         )
         sig_field[pdf_name('/SV')] = sv_ref
+
+    if sig_field_spec.box is not None:
+        llx, lly, urx, ury = sig_field_spec.box
+        w = abs(urx - llx)
+        h = abs(ury - lly)
+        # TODO: allow appearance customisation through sig_field_spec
+        if w and h:
+            sig_field[pdf_name('/AP')] = ap_dict = generic.DictionaryObject()
+            # draw a simple rectangle
+            appearance_cmds = [
+                b'q',
+                b'q 0.95 0.95 0.95 rg 0 0 %g %g re f Q' % (w, h),  # background
+                b'0.5 w 0 0 %g %g re S' % (w, h),  # border
+                b'Q'
+            ]
+            ap_stream = RawContent(
+                b' '.join(appearance_cmds),
+                box=BoxConstraints(width=w, height=h)
+            ).as_form_xobject()
+            ap_dict[pdf_name('/N')] = pdf_out.add_object(ap_stream)
 
     lock = sig_field_spec.format_lock_dictionary()
     if lock is not None:
@@ -1459,6 +1499,7 @@ class SignatureFormField(generic.DictionaryObject):
             pdf_name('/T'): pdf_string(field_name),
         })
 
+        self.combine_annotation = combine_annotation
         if combine_annotation:
             annot_dict = self
         else:
@@ -1479,7 +1520,7 @@ class SignatureFormField(generic.DictionaryObject):
     def register_widget_annotation(self, writer: BasePdfFileWriter,
                                    sig_field_ref):
         annot_dict = self.annot_dict
-        if annot_dict is not self:
+        if not self.combine_annotation:
             annot_ref = writer.add_object(annot_dict)
             self['/Kids'] = generic.ArrayObject([annot_ref])
         else:

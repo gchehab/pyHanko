@@ -11,9 +11,10 @@ from asn1crypto import (
     cms, tsp, ocsp as asn1_ocsp, pdf as asn1_pdf, crl as asn1_crl, x509,
 )
 from asn1crypto.x509 import Certificate
+from cryptography.hazmat.primitives import hashes
 
-from certvalidator import ValidationContext, CertificateValidator
-from certvalidator.path import ValidationPath
+from pyhanko_certvalidator import ValidationContext, CertificateValidator
+from pyhanko_certvalidator.path import ValidationPath
 
 from pyhanko.pdf_utils import generic, misc
 from pyhanko.pdf_utils.generic import pdf_name
@@ -35,7 +36,8 @@ from .general import (
     SignatureStatus, find_cms_attribute,
     UnacceptableSignerError, KeyUsageConstraints,
     SignatureValidationError,
-    validate_sig_integrity,
+    validate_sig_integrity, DEFAULT_WEAK_HASH_ALGORITHMS,
+    get_pyca_cryptography_hash,
 )
 from .timestamps import TimestampSignatureStatus
 
@@ -46,6 +48,8 @@ __all__ = [
     'apply_adobe_revocation_info', 'get_timestamp_chain',
     'read_certification_data', 'validate_pdf_ltv_signature',
     'validate_pdf_signature', 'validate_cms_signature',
+    'validate_pdf_timestamp', 'collect_validation_info',
+    'add_validation_info',
     'ValidationInfoReadingError', 'SigSeedValueValidationError'
 ]
 
@@ -57,6 +61,11 @@ class ValidationInfoReadingError(ValueError):
     pass
 
 
+class NoDSSFoundError(ValidationInfoReadingError):
+    def __init__(self):
+        super().__init__("No DSS found")
+
+
 class SigSeedValueValidationError(SignatureValidationError):
     """Error validating a signature's seed value constraints."""
 
@@ -64,7 +73,7 @@ class SigSeedValueValidationError(SignatureValidationError):
     #  seed value that tripped the failure.
 
     def __init__(self, failure_message):
-        self.failure_message = failure_message
+        self.failure_message = str(failure_message)
         super().__init__(failure_message)
 
 
@@ -125,11 +134,16 @@ def _validate_cms_signature(signed_data: cms.SignedData,
     """
     signer_info, cert, other_certs = _extract_signer_info_and_certs(signed_data)
 
+    weak_hash_algos = None
+    if validation_context is not None:
+        weak_hash_algos = validation_context.weak_hash_algos
+    if weak_hash_algos is None:
+        weak_hash_algos = DEFAULT_WEAK_HASH_ALGORITHMS
+
     signature_algorithm: cms.SignedDigestAlgorithm = \
         signer_info['signature_algorithm']
     mechanism = signature_algorithm['algorithm'].native
     md_algorithm = signer_info['digest_algorithm']['algorithm'].native
-
     expected_content_type = 'data'
     if raw_digest is None:
         # this means that there should be encapsulated data
@@ -137,12 +151,15 @@ def _validate_cms_signature(signed_data: cms.SignedData,
         expected_content_type = eci['content_type'].native
 
         raw = eci['content'].parsed.dump()
-        raw_digest = getattr(hashlib, md_algorithm)(raw).digest()
+        md_spec = get_pyca_cryptography_hash(md_algorithm)
+        md = hashes.Hash(md_spec)
+        md.update(raw)
+        raw_digest = md.finalize()
 
     # first, do the cryptographic identity checks
     intact, valid = validate_sig_integrity(
         signer_info, cert, expected_content_type=expected_content_type,
-        actual_digest=raw_digest,
+        actual_digest=raw_digest, weak_hash_algorithms=weak_hash_algos
     )
 
     # if the data being encapsulated by the signature is itself invalid,
@@ -321,6 +338,11 @@ class PdfSignatureStatus(ModificationInfo, SignatureStatus):
     if present.
     """
 
+    has_seed_values: bool = False
+    """
+    Records whether the signature form field has seed values.
+    """
+
     seed_value_constraint_error: Optional[SigSeedValueValidationError] = None
     """
     Records the reason for failure if the signature field's seed value
@@ -347,7 +369,8 @@ class PdfSignatureStatus(ModificationInfo, SignatureStatus):
             timestamp_ok = ts.valid and ts.trusted
         return (
             self.valid and self.trusted and self.seed_value_ok
-            and self.docmdp_ok and timestamp_ok
+            and (self.docmdp_ok or self.modification_level is None)
+            and timestamp_ok
         )
 
     @property
@@ -414,7 +437,6 @@ class PdfSignatureStatus(ModificationInfo, SignatureStatus):
         if self.coverage == SignatureCoverageLevel.ENTIRE_FILE:
             modification_str = "The signature covers the entire file."
         else:
-            modlvl_string = "Some modifications may be illegitimate"
             if self.modification_level is not None:
                 if self.modification_level == ModificationLevel.LTA_UPDATES:
                     modlvl_string = \
@@ -424,12 +446,16 @@ class PdfSignatureStatus(ModificationInfo, SignatureStatus):
                         "All modifications relate to signing and form filling "
                         "operations"
                     )
-            modification_str = (
-                "The signature does not cover the entire file.\n"
-                f"{modlvl_string}, and they appear to be "
-                f"{'' if self.docmdp_ok else 'in'}compatible with the "
-                "current document modification policy."
-            )
+                else:
+                    modlvl_string = "Some modifications may be illegitimate"
+                modification_str = (
+                    "The signature does not cover the entire file.\n"
+                    f"{modlvl_string}, and they appear to be "
+                    f"{'' if self.docmdp_ok else 'in'}compatible with the "
+                    "current document modification policy."
+                )
+            else:
+                modification_str = "Incremental update analysis was skipped"
 
         validity_info = (
             "The signature is cryptographically "
@@ -474,21 +500,22 @@ class PdfSignatureStatus(ModificationInfo, SignatureStatus):
             f"The signature is judged {'' if self.bottom_line else 'IN'}VALID."
         )
 
-        if self.seed_value_ok:
-            sv_info = "There were no SV issues detected for this signature."
-        else:
-            sv_info = (
-                "The signature did not satisfy the SV constraints on "
-                "the signature field.\nError message: "
-                + self.seed_value_constraint_error.failure_message
-            )
-
         sections = [
             ("Signer info", about_signer), ("Integrity", validity_info),
             ("Signing time", timing_info),
-            ("Seed value constraints", sv_info),
-            ("Bottom line", bottom_line)
         ]
+        if self.has_seed_values:
+            if self.seed_value_ok:
+                sv_info = "There were no SV issues detected for this signature."
+            else:
+                sv_info = (
+                    "The signature did not satisfy the SV constraints on "
+                    "the signature field.\nError message: "
+                    + self.seed_value_constraint_error.failure_message
+                )
+            sections.append(("Seed value constraints", sv_info))
+
+        sections.append(("Bottom line", bottom_line))
         return '\n'.join(
             fmt_section(hdr, body) for hdr, body in sections
         )
@@ -506,6 +533,7 @@ def _extract_reference_dict(signature_obj, method) \
     except KeyError:
         return
     for ref in sig_refs:
+        ref = ref.get_object()
         if ref['/TransformMethod'] == method:
             return ref
 
@@ -515,7 +543,7 @@ def _extract_docmdp_for_sig(signature_obj) -> Optional[MDPPerm]:
     if ref is None:
         return
     try:
-        raw_perms = ref.raw_get('/TransformParams').raw_get('/P')
+        raw_perms = ref['/TransformParams'].raw_get('/P')
         return MDPPerm(raw_perms)
     except (ValueError, KeyError) as e:  # pragma: nocover
         raise SignatureValidationError(
@@ -633,6 +661,18 @@ class EmbeddedPdfSignature:
         self.diff_result = None
         self._integrity_checked = False
         self.fq_name = fq_name
+
+    @property
+    def sig_object_type(self) -> generic.NameObject:
+        """
+        Returns the type of the embedded signature object.
+        For ordinary signatures, this will be ``/Sig``.
+        In the case of a document timestamp, ``/DocTimeStamp`` is returned.
+
+        :return:
+            A PDF name object describing the type of signature.
+        """
+        return self.sig_object.get('/Type', pdf_name('/Sig'))
 
     @property
     def field_name(self):
@@ -757,7 +797,8 @@ class EmbeddedPdfSignature:
     def docmdp_level(self) -> Optional[MDPPerm]:
         """
         :return:
-            The document modification policy required by this signature.
+            The document modification policy required by this signature or
+            its Lock dictionary.
 
             .. warning::
                 This does not take into account the DocMDP requirements of
@@ -770,11 +811,16 @@ class EmbeddedPdfSignature:
                 the earlier signature with the stricter DocMDP policy.
 
         """
-        # TODO fall back to reading /Lock in case the signing software
-        #  ignored the /Lock dictionary when building up the signature object
         if self._docmdp_queried:
             return self._docmdp
         docmdp = _extract_docmdp_for_sig(signature_obj=self.sig_object)
+
+        if docmdp is None:
+            try:
+                lock_dict = self.sig_field['/Lock']
+                docmdp = MDPPerm(lock_dict['/P'])
+            except KeyError:
+                pass
         self._docmdp = docmdp
         self._docmdp_queried = True
         return docmdp
@@ -813,7 +859,8 @@ class EmbeddedPdfSignature:
         if self.external_digest is not None:
             return self.external_digest
 
-        md = getattr(hashlib, self.external_md_algorithm)()
+        md_spec = get_pyca_cryptography_hash(self.external_md_algorithm)
+        md = hashes.Hash(md_spec)
         stream = self.reader.stream
 
         # compute the digest
@@ -828,7 +875,7 @@ class EmbeddedPdfSignature:
             total_len += chunk_len
 
         self.total_len = total_len
-        self.external_digest = digest = md.digest()
+        self.external_digest = digest = md.finalize()
         return digest
 
     def compute_tst_digest(self) -> Optional[bytes]:
@@ -860,8 +907,10 @@ class EmbeddedPdfSignature:
         tst_md_algorithm = mi['hash_algorithm']['algorithm'].native
 
         signature_bytes = self.signer_info['signature'].native
-        md = getattr(hashlib, tst_md_algorithm)(signature_bytes)
-        self.tst_signature_digest = digest = md.digest()
+        tst_md_spec = get_pyca_cryptography_hash(tst_md_algorithm)
+        md = hashes.Hash(tst_md_spec)
+        md.update(signature_bytes)
+        self.tst_signature_digest = digest = md.finalize()
         return digest
 
     def evaluate_signature_coverage(self) -> SignatureCoverageLevel:
@@ -959,14 +1008,11 @@ def _validate_sv_constraints(emb_sig: EmbeddedPdfSignature,
                              signing_cert, validation_path, timestamp_found):
 
     sv_spec = emb_sig.seed_value_spec
-    if sv_spec is None:
-        return
-
     if sv_spec.cert is not None:
         try:
             sv_spec.cert.satisfied_by(signing_cert, validation_path)
         except UnacceptableSignerError as e:
-            raise SigSeedValueValidationError(e)
+            raise SigSeedValueValidationError(e) from e
 
     if not timestamp_found and sv_spec.timestamp_required:
         raise SigSeedValueValidationError(
@@ -1116,6 +1162,10 @@ def _validate_sv_constraints(emb_sig: EmbeddedPdfSignature,
 
 
 def _validate_sv_and_update(embedded_sig, status_kwargs, timestamp_found):
+    sv_spec = embedded_sig.seed_value_spec
+    if sv_spec is None:
+        return
+    status_kwargs['has_seed_values'] = True
     try:
         _validate_sv_constraints(
             embedded_sig, status_kwargs['signing_cert'],
@@ -1171,11 +1221,8 @@ def validate_pdf_signature(embedded_sig: EmbeddedPdfSignature,
     """
 
     sig_object = embedded_sig.sig_object
-    try:
-        if sig_object['/Type'] != '/Sig':
-            raise SignatureValidationError("Signature object type must be /Sig")
-    except KeyError:
-        pass
+    if embedded_sig.sig_object_type != '/Sig':
+        raise SignatureValidationError("Signature object type must be /Sig")
 
     # check whether the subfilter type is one we support
     subfilter_str = sig_object.get('/SubFilter', None)
@@ -1248,21 +1295,13 @@ def validate_pdf_timestamp(embedded_sig: EmbeddedPdfSignature,
         The status of the PDF timestamp in question.
     """
 
-    sig_object = embedded_sig.sig_object
-    invalid_obj_type = False
-    try:
-        if sig_object['/Type'] != '/DocTimeStamp':
-            invalid_obj_type = True
-    except KeyError:
-        invalid_obj_type = True
-
-    if invalid_obj_type:
+    if embedded_sig.sig_object_type != '/DocTimeStamp':
         raise SignatureValidationError(
             "Signature object type must be /DocTimeStamp"
         )
 
     # check whether the subfilter type is one we support
-    subfilter_str = sig_object.get('/SubFilter', None)
+    subfilter_str = embedded_sig.sig_object.get('/SubFilter', None)
     _validate_subfilter(
         subfilter_str, (SigSeedSubFilter.ETSI_RFC3161,),
         "%s is not a recognized SubFilter type for timestamps."
@@ -1344,7 +1383,8 @@ def _validate_timestamp(tst_signed_data, validation_context,
         encap_data_invalid = False
     timestamp = tst_info['gen_time'].native
     return _validate_cms_signature(
-        tst_signed_data, validation_context=validation_context,
+        tst_signed_data, status_cls=TimestampSignatureStatus,
+        validation_context=validation_context,
         status_kwargs={'timestamp': timestamp},
         encap_data_invalid=encap_data_invalid
     )
@@ -1392,7 +1432,10 @@ def _establish_timestamp_trust_lta(reader, bootstrap_validation_context,
     timestamps = get_timestamp_chain(reader)
     validation_context_kwargs = dict(validation_context_kwargs)
     current_vc = bootstrap_validation_context
-    for emb_timestamp in timestamps:
+    ts_status = None
+    ts_count = -1
+    emb_timestamp = None
+    for ts_count, emb_timestamp in enumerate(timestamps):
         if emb_timestamp.signed_revision < until_revision:
             break
 
@@ -1406,17 +1449,23 @@ def _establish_timestamp_trust_lta(reader, bootstrap_validation_context,
         )
         # read the DSS at the current revision into a new
         # validation context object
-        current_vc = DocumentSecurityStore.read_dss(
-            reader.get_historical_resolver(emb_timestamp.signed_revision)
-        ).as_validation_context(validation_context_kwargs)
+        try:
+            current_vc = DocumentSecurityStore.read_dss(
+                reader.get_historical_resolver(emb_timestamp.signed_revision)
+            ).as_validation_context(validation_context_kwargs)
+        except NoDSSFoundError:
+            current_vc = ValidationContext(**validation_context_kwargs)
 
-    return current_vc
+    return emb_timestamp, ts_status, ts_count + 1, current_vc
 
 
 # TODO verify formal PAdES requirements for timestamps
 # TODO verify other formal PAdES requirements (coverage, etc.)
 # TODO signature/verification policy-based validation! (PAdES-EPES-* etc)
 #  (this is a different beast, though)
+# TODO "tolerant" timestamp validation, where we tolerate problems in the
+#  timestamp chain provided that newer timestamps are "strong" enough to
+#  cover the gap.
 def validate_pdf_ltv_signature(embedded_sig: EmbeddedPdfSignature,
                                validation_type: RevocationInfoValidationType,
                                validation_context_kwargs=None,
@@ -1433,7 +1482,7 @@ def validate_pdf_ltv_signature(embedded_sig: EmbeddedPdfSignature,
     :param validation_type:
         Validation profile to use.
     :param validation_context_kwargs:
-        Keyword args to instantiate :class:`.certvalidator.ValidationContext`
+        Keyword args to instantiate :class:`.pyhanko_certvalidator.ValidationContext`
         objects needed over the course of the validation.
     :param bootstrap_validation_context:
         Validation context used to validate the current timestamp.
@@ -1488,37 +1537,70 @@ def validate_pdf_ltv_signature(embedded_sig: EmbeddedPdfSignature,
     embedded_sig.compute_digest()
     embedded_sig.compute_tst_digest()
 
-    # first, we need to validate the timestamp (or timestamp chain) *now*
-    # in particular, this implies that we can't just use revocation info
-    # from the DSS yet, since we don't yet trust the timestamp to be accurate
-    # There are two main cases:
-    #  (a) We're doing PAdES B-LT or Adobe-style verification.
-    #      In that case, we simply attempt to validate the timestamp as-is.
-    #  (b) We're doing PAdES B-LTA. In this case, we first verify the document
-    #      timestamp chain until the revision in which the signature appears.
-    #      This is bootstrapped using the current validation context.
-    #      If successful, we obtain a new validation context set to a new
-    #      "known good" verification time. We then proceed as in (a) using this
-    #      new validation context instead of the current one.
-    if validation_type == RevocationInfoValidationType.PADES_LTA:
-        current_vc = _establish_timestamp_trust_lta(
-            reader, current_vc, validation_context_kwargs,
-            until_revision=embedded_sig.signed_revision
+    # If the validation profile is PAdES-type, then we validate the timestamp
+    #  chain now.
+    #  This is bootstrapped using the current validation context.
+    #  If successful, we obtain a new validation context set to a new
+    #  "known good" verification time. We then repeat the process using this
+    #  new validation context instead of the current one.
+    earliest_good_timestamp_st = None
+    ts_chain_length = 0
+    # also record the embedded sig object assoc. with the oldest applicable
+    # DTS in the timestamp chain
+    latest_dts = None
+    if validation_type != RevocationInfoValidationType.ADOBE_STYLE:
+        latest_dts, earliest_good_timestamp_st, ts_chain_length, current_vc = \
+            _establish_timestamp_trust_lta(
+                reader, current_vc, validation_context_kwargs,
+                until_revision=embedded_sig.signed_revision
+            )
+        # In PAdES-LTA, we should only rely on DSS information that is covered
+        # by an appropriate document timestamp.
+        # If the validation profile is PAdES-LTA, then we must have seen
+        # at least one document timestamp pass by, i.e. earliest_known_timestamp
+        # must be non-None by now.
+        if earliest_good_timestamp_st is None \
+                and validation_type == RevocationInfoValidationType.PADES_LTA:
+            raise SignatureValidationError(
+                "Purported PAdES-LTA signature does not have a timestamp chain."
+            )
+        # if this assertion fails, there's a bug in the validation code
+        assert validation_type == RevocationInfoValidationType.PADES_LT \
+               or ts_chain_length >= 1
+
+    # now that we have arrived at the revision with the signature,
+    # we can check for a timestamp token attribute there
+    # (This is allowed, regardless of whether we use Adobe-style LTV or
+    # a PAdES validation profile)
+    tst_signed_data = embedded_sig.attached_timestamp_data
+    if tst_signed_data is not None:
+        earliest_good_timestamp_st = _establish_timestamp_trust(
+            tst_signed_data, current_vc, embedded_sig.tst_signature_digest
+        )
+    elif validation_type == RevocationInfoValidationType.PADES_LTA \
+            and ts_chain_length == 1:
+        # TODO Pretty sure that this is the spirit of the LTA profile,
+        #  but are we being too harsh here? I don't think so, but it's worth
+        #  revisiting later
+        # For later review: I believe that this check is appropriate, because
+        # the timestamp that protects the signature should be verifiable
+        # using only information from the next DSS, which should in turn
+        # also be protected using a DTS. This requires at least two timestamps.
+        raise SignatureValidationError(
+            "PAdES-LTA signature requires separate timestamps protecting "
+            "the signature & the rest of the revocation info."
         )
 
-    # FIXME in the LTA case, this is an unreasonable requirement (since the
-    #  /DocTimeStamps can serve this purpose)
-    tst_signed_data = embedded_sig.attached_timestamp_data
-    if tst_signed_data is None:
+    # if, by now, we still don't have a trusted timestamp, there's a problem
+    # regardless of the validation profile in use.
+    if earliest_good_timestamp_st is None:
         raise SignatureValidationError(
             'LTV signatures require a trusted timestamp.'
         )
 
-    ts_result = _establish_timestamp_trust(
-        tst_signed_data, current_vc, embedded_sig.tst_signature_digest
+    _strict_vc_context_kwargs(
+        earliest_good_timestamp_st.timestamp, validation_context_kwargs
     )
-    timestamp = ts_result.timestamp
-    _strict_vc_context_kwargs(timestamp, validation_context_kwargs)
 
     if validation_type == RevocationInfoValidationType.ADOBE_STYLE:
         ocsps, crls = retrieve_adobe_revocation_info(
@@ -1527,22 +1609,52 @@ def validate_pdf_ltv_signature(embedded_sig: EmbeddedPdfSignature,
         validation_context_kwargs['ocsps'] = ocsps
         validation_context_kwargs['crls'] = crls
         stored_vc = ValidationContext(**validation_context_kwargs)
-    else:
+    elif validation_type == RevocationInfoValidationType.PADES_LT:
+        # in this case, we don't care about whether the information
+        # in the DSS is protected by any timestamps, so just ingest everything
         stored_vc = dss.as_validation_context(validation_context_kwargs)
+    else:
+        # in the LTA profile, we should use only DSS information covered
+        # by the last relevant timestamp, so the correct VC is current_vc
+        current_vc.moment = earliest_good_timestamp_st.timestamp
+        stored_vc = current_vc
 
-    # next, we validate the timestamp *again*, this time using the data
-    # in the DSS / revocation info store.
-    timestamp_status: TimestampSignatureStatus = validate_cms_signature(
-        tst_signed_data, status_cls=TimestampSignatureStatus,
-        validation_context=stored_vc, status_kwargs={'timestamp': timestamp}
-    )
+    # Now, we evaluate the validity of the timestamp guaranteeing the signature
+    #  *within* the LTV context.
+    #   (i.e. we check whether there's enough revinfo to keep tabs on the
+    #   timestamp's validity)
+    # If the last timestamp comes from a timestamp token attached to the
+    # signature, it should be possible to validate it using only data from the
+    # DSS / revocation info store, so validate the timestamp *again*
+    # using those settings.
+
+    if tst_signed_data is not None or \
+            validation_type == RevocationInfoValidationType.PADES_LT:
+        if tst_signed_data is not None:
+            ts_to_validate = tst_signed_data
+        else:
+            # we're in the PAdES-LT case with a detached TST now.
+            # this should be conceptually equivalent to the above
+            # so we run the same check here
+            ts_to_validate = latest_dts.signed_data
+        timestamp_status: TimestampSignatureStatus = validate_cms_signature(
+            ts_to_validate, status_cls=TimestampSignatureStatus,
+            validation_context=stored_vc, status_kwargs={
+                'timestamp': earliest_good_timestamp_st.timestamp
+            }
+        )
+    else:
+        # In the LTA case, we don't have to do any further checks, since the
+        # _establish_timestamp_trust_lta handled that for us.
+        # We can therefore just take earliest_good_timestamp_st at face value.
+        timestamp_status = earliest_good_timestamp_st
 
     embedded_sig.compute_integrity_info(
         diff_policy=diff_policy, skip_diff=skip_diff
     )
     status_kwargs = embedded_sig.summarise_integrity_info()
     status_kwargs.update({
-        'signer_reported_dt': timestamp,
+        'signer_reported_dt': earliest_good_timestamp_st.timestamp,
         'timestamp_validity': timestamp_status
     })
     status_kwargs = _validate_cms_signature(
@@ -1562,8 +1674,10 @@ def retrieve_adobe_revocation_info(signer_info: cms.SignerInfo):
         revinfo: asn1_pdf.RevocationInfoArchival = find_cms_attribute(
             signer_info['signed_attrs'], "adobe_revocation_info_archival"
         )[0]
-    except KeyError:
-        raise ValidationInfoReadingError("No revocation info found")
+    except KeyError as e:
+        raise ValidationInfoReadingError(
+            "No revocation info archival attribute found"
+        ) from e
 
     ocsps = list(revinfo['ocsp'] or ())
     crls = list(revinfo['crl'] or ())
@@ -1677,6 +1791,124 @@ def enumerate_ocsp_certs(ocsp_response):
         if response_bytes['response_type'].native == 'basic_ocsp_response':
             response = response_bytes['response'].parsed
             yield from response['certs']
+
+
+def collect_validation_info(embedded_sig: EmbeddedPdfSignature,
+                            validation_context: ValidationContext,
+                            skip_timestamp=False):
+    """
+    Query revocation info for a PDF signature using a validation context,
+    and store the results in a validation context.
+
+    This works by validating the signer's certificate against the provided
+    validation context, which causes revocation info to be cached for
+    later retrieval.
+
+    .. warning::
+        This function does *not* actually validate the signature, but merely
+        checks the signer certificate's chain of trust.
+
+    :param embedded_sig:
+        Embedded PDF signature to operate on.
+    :param validation_context:
+        Validation context to use.
+    :param skip_timestamp:
+        If the signature has a time stamp token attached to it, also collect
+        revocation information for the timestamp.
+    :return:
+        A list of validation paths.
+    """
+
+    if validation_context.revocation_mode == 'soft-fail':
+        logger.warning(
+            "Revocation mode is set to soft-fail; collected revocation "
+            "information may be incomplete."
+        )
+
+    paths = []
+
+    def _validate_signed_data(signed_data):
+        signer_info, cert, other_certs = \
+            _extract_signer_info_and_certs(signed_data)
+
+        validator = CertificateValidator(
+            cert, intermediate_certs=other_certs,
+            validation_context=validation_context
+        )
+        path = validator.validate_usage(key_usage=set())
+        paths.append(path)
+
+    _validate_signed_data(embedded_sig.signed_data)
+    if not skip_timestamp and embedded_sig.attached_timestamp_data is not None:
+        _validate_signed_data(embedded_sig.attached_timestamp_data)
+
+    return paths
+
+
+def add_validation_info(embedded_sig: EmbeddedPdfSignature,
+                        validation_context: ValidationContext,
+                        skip_timestamp=False, add_vri_entry=True,
+                        in_place=False, output=None, chunk_size=4096):
+    """
+    Add validation info (CRLs, OCSP responses, extra certificates) for a
+    signature to the DSS of a document in an incremental update.
+    This is a wrapper around :func:`collect_validation_info`.
+
+    :param embedded_sig:
+        The signature for which the revocation information needs to be
+        collected.
+    :param validation_context:
+        The validation context to use.
+    :param skip_timestamp:
+        If ``True``, do not attempt to validate the timestamp attached to
+        the signature, if one is present.
+    :param add_vri_entry:
+        Add a ``/VRI`` entry for this signature to the document security store.
+        Default is ``True``.
+    :param output:
+        Write the output to the specified output stream.
+        If ``None``, write to a new :class:`.BytesIO` object.
+        Default is ``None``.
+    :param in_place:
+        Sign the original input stream in-place.
+        This parameter overrides ``output``.
+    :param chunk_size:
+        Chunk size parameter to use when copying output to a new stream
+        (irrelevant if ``in_place`` is ``True``).
+    :return:
+        The (file-like) output object to which the result was written.
+    """
+
+    reader: PdfFileReader = embedded_sig.reader
+    if in_place:
+        output = reader.stream
+    # Take care of this first, so we get any errors re: stream properties out
+    # of the way before doing the (potentially) expensive validation operations
+    output = misc.prepare_rw_output_stream(output)
+
+    # if the output is not the same as the input reader's stream, copy the
+    # original file contents to the output before calling add_dss
+    if not in_place:
+        temp_buffer = bytearray(chunk_size)
+        reader.stream.seek(0)
+        misc.chunked_write(temp_buffer, reader.stream, output)
+
+    paths = collect_validation_info(
+        embedded_sig, validation_context, skip_timestamp=skip_timestamp
+    )
+
+    # TODO Since add_dss has to re-parse the xref table, this is suboptimal
+    #  in terms of efficiency, but we can iterate on that later
+    if add_vri_entry:
+        sig_contents = embedded_sig.pkcs7_content.hex().encode('ascii')
+    else:
+        sig_contents = None
+
+    DocumentSecurityStore.add_dss(
+        output, sig_contents, validation_context=validation_context,
+        paths=paths
+    )
+    return output
 
 
 class DocumentSecurityStore:
@@ -1852,17 +2084,19 @@ class DocumentSecurityStore:
         certs = list(self._load_certs()) + extra_certs
 
         if include_revinfo:
-            ocsps = validation_context_kwargs['ocsps'] = []
+            ocsps = list(validation_context_kwargs.pop('ocsps', ()))
             for ocsp_ref in self.ocsps:
                 ocsp_stream: generic.StreamObject = ocsp_ref.get_object()
                 resp = asn1_ocsp.OCSPResponse.load(ocsp_stream.data)
                 ocsps.append(resp)
+            validation_context_kwargs['ocsps'] = ocsps
 
-            crls = validation_context_kwargs['crls'] = []
+            crls = list(validation_context_kwargs.pop('crls', ()))
             for crl_ref in self.crls:
                 crl_stream: generic.StreamObject = crl_ref.get_object()
                 crl = asn1_crl.CertificateList.load(crl_stream.data)
                 crls.append(crl)
+            validation_context_kwargs['crls'] = crls
 
         return ValidationContext(
             other_certs=certs, **validation_context_kwargs
@@ -1881,8 +2115,8 @@ class DocumentSecurityStore:
         """
         try:
             dss_ref = handler.root.raw_get(pdf_name('/DSS'))
-        except KeyError:
-            raise ValidationInfoReadingError("No DSS found")
+        except KeyError as e:
+            raise NoDSSFoundError() from e
 
         dss_dict = dss_ref.get_object()
 
@@ -1939,12 +2173,13 @@ class DocumentSecurityStore:
         The result is applied to the output stream as an incremental update.
 
         You can either specify the CMS objects to include directly, or
-        pass them in as output from `certvalidator`.
+        pass them in as output from `pyhanko_certvalidator`.
 
         :param output_stream:
             Output stream to write to.
         :param sig_contents:
-            Contents of the new signature (used to compute the VRI hash).
+            Contents of the new signature (used to compute the VRI hash), as
+            as a hexadecimal string, including any padding.
             If ``None``, the information will not be added to any VRI
             dictionary.
         :param certs:

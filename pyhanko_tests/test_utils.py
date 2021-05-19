@@ -23,7 +23,7 @@ from pyhanko.pdf_utils.crypt import (
     PubKeySecurityHandler, SecurityHandlerVersion, CryptFilterConfiguration,
     StandardRC4CryptFilter, StandardAESCryptFilter, STD_CF,
     PubKeyRC4CryptFilter, PubKeyAESCryptFilter, PubKeyAdbeSubFilter,
-    DEFAULT_CRYPT_FILTER,
+    DEFAULT_CRYPT_FILTER, build_crypt_filter, SecurityHandler,
 )
 from pyhanko.pdf_utils.rw_common import PdfHandler
 from pyhanko.sign.general import load_cert_from_pemder
@@ -1012,24 +1012,28 @@ def test_pubkey_encryption_s5_requires_cfs():
 
 def test_pubkey_encryption_dict_errors():
     sh = PubKeySecurityHandler.build_from_certs([PUBKEY_TEST_DECRYPTER.cert])
-    original= sh.as_pdf_object()
 
-    encrypt = generic.DictionaryObject(original)
+    encrypt = generic.DictionaryObject(sh.as_pdf_object())
     encrypt['/SubFilter'] = pdf_name('/asdflakdsjf')
     with pytest.raises(misc.PdfReadError):
         PubKeySecurityHandler.build(encrypt)
 
-    encrypt = generic.DictionaryObject(original)
+    encrypt = generic.DictionaryObject(sh.as_pdf_object())
     encrypt['/Length'] = generic.NumberObject(13)
     with pytest.raises(misc.PdfError):
         PubKeySecurityHandler.build(encrypt)
 
-    encrypt = generic.DictionaryObject(original)
+    encrypt = generic.DictionaryObject(sh.as_pdf_object())
     del encrypt['/CF']['/DefaultCryptFilter']['/CFM']
     with pytest.raises(misc.PdfReadError):
         PubKeySecurityHandler.build(encrypt)
 
-    encrypt = generic.DictionaryObject(original)
+    encrypt = generic.DictionaryObject(sh.as_pdf_object())
+    del encrypt['/CF']['/DefaultCryptFilter']['/Recipients']
+    with pytest.raises(misc.PdfReadError):
+        PubKeySecurityHandler.build(encrypt)
+
+    encrypt = generic.DictionaryObject(sh.as_pdf_object())
     encrypt['/CF']['/DefaultCryptFilter']['/CFM'] = pdf_name('/None')
     with pytest.raises(misc.PdfReadError):
         PubKeySecurityHandler.build(encrypt)
@@ -1300,7 +1304,7 @@ def test_pubkey_wrong_cert():
     w = writer.PdfFileWriter()
 
     recpt_cert = load_cert_from_pemder(
-        TESTING_CA_DIR + '/intermediate/newcerts/signer2.cert.pem'
+        TESTING_CA_DIR + '/interm/decrypter2.cert.pem'
     )
     test_data = b'This is test data!'
     dummy_stream = generic.StreamObject(stream_data=test_data)
@@ -1424,3 +1428,147 @@ def test_bool_dunders():
 
     assert repr(bool_true) == str(bool_true) == 'True'
     assert repr(bool_false) == str(bool_false) == 'False'
+
+
+def test_pdf_num_precision():
+    assert repr(generic.FloatObject('32.00001')) == '32.00001'
+    assert repr(generic.FloatObject('32.92001')) == '32.92001'
+    assert repr(generic.FloatObject('32')) == '32'
+
+
+@pytest.mark.parametrize('arr_str', [b'[1 1 1]', b'[1 1 1\x00\x00\x00]',
+                                     b'[1\x00\x001 1 ]'])
+def test_array_null_bytes(arr_str):
+    stream = BytesIO(arr_str)
+    parsed = generic.ArrayObject.read_from_stream(stream, generic.Reference(1))
+    assert parsed == [1, 1, 1]
+
+
+def test_crypt_filter_build_failures():
+    cfdict = generic.DictionaryObject()
+    assert build_crypt_filter({}, cfdict, False) is None
+    cfdict['/CFM'] = generic.NameObject('/None')
+    assert build_crypt_filter({}, cfdict, False) is None
+
+    with pytest.raises(NotImplementedError):
+        cfdict['/CFM'] = generic.NameObject('/NoSuchCF')
+        build_crypt_filter({}, cfdict, False)
+
+
+@pytest.mark.parametrize('on_subclass', [True, False])
+def test_custom_crypt_filter_type(on_subclass):
+    w = writer.PdfFileWriter()
+    custom_cf_type = pdf_name('/CustomCFType')
+
+    class CustomCFClass(StandardRC4CryptFilter):
+        def __init__(self):
+            super().__init__(keylen=16)
+        method = custom_cf_type
+
+    if on_subclass:
+        class NewStandardSecurityHandler(StandardSecurityHandler):
+            pass
+        sh_class = NewStandardSecurityHandler
+        assert sh_class._known_crypt_filters is \
+               not StandardSecurityHandler._known_crypt_filters
+        assert '/V2' in sh_class._known_crypt_filters
+        SecurityHandler.register(sh_class)
+    else:
+        sh_class = StandardSecurityHandler
+
+    sh_class.register_crypt_filter(
+        custom_cf_type, lambda _, __: CustomCFClass(),
+    )
+    cfc = CryptFilterConfiguration(
+        crypt_filters={STD_CF: CustomCFClass()},
+        default_string_filter=STD_CF, default_stream_filter=STD_CF
+    )
+    sh = sh_class.build_from_pw_legacy(
+        rev=StandardSecuritySettingsRevision.RC4_OR_AES128,
+        id1=w.document_id[0], desired_user_pass="usersecret",
+        desired_owner_pass="ownersecret",
+        keylen_bytes=16, crypt_filter_config=cfc
+    )
+    assert isinstance(sh, sh_class)
+    w._assign_security_handler(sh)
+    test_data = b'This is test data!'
+    dummy_stream = generic.StreamObject(stream_data=test_data)
+    ref = w.add_object(dummy_stream)
+
+    out = BytesIO()
+    w.write(out)
+    r = PdfFileReader(out)
+    r.decrypt("ownersecret")
+    obj: generic.StreamObject = r.get_object(ref.reference)
+    assert obj.data == test_data
+
+    obj: generic.DecryptedObjectProxy = \
+        r.get_object(ref.reference, transparent_decrypt=False)
+    assert isinstance(obj.raw_object, generic.StreamObject)
+    assert obj.raw_object.encoded_data != test_data
+
+    # restore security handler registry state
+    del sh_class._known_crypt_filters[custom_cf_type]
+    if on_subclass:
+        SecurityHandler.register(StandardSecurityHandler)
+
+
+def test_security_handler_version_deser():
+    assert SecurityHandlerVersion.from_number(5) \
+           == SecurityHandlerVersion.AES256
+    assert SecurityHandlerVersion.from_number(6) == SecurityHandlerVersion.OTHER
+    assert SecurityHandlerVersion.from_number(None) \
+           == SecurityHandlerVersion.OTHER
+
+    assert StandardSecuritySettingsRevision.from_number(6) \
+           == StandardSecuritySettingsRevision.AES256
+    assert StandardSecuritySettingsRevision.from_number(7) \
+           == StandardSecuritySettingsRevision.OTHER
+
+
+def test_ordered_enum():
+
+    class Version(misc.OrderedEnum):
+        VER1 = 1
+        VER2 = 2
+
+    assert Version.VER2 > Version.VER1
+    assert Version.VER2 >= Version.VER1
+    assert not (Version.VER1 > Version.VER1)
+
+    assert Version.VER1 < Version.VER2
+    assert Version.VER1 <= Version.VER2
+    assert not (Version.VER1 < Version.VER1)
+
+
+def test_version_enum():
+
+    class Version(misc.VersionEnum):
+        VER1 = 1
+        VER2 = 2
+        FUTURE = None
+
+    assert Version.VER2 > Version.VER1
+    assert Version.VER2 >= Version.VER1
+    assert Version.FUTURE > Version.VER1
+    assert Version.FUTURE >= Version.VER1
+    assert not (Version.FUTURE > Version.FUTURE)
+    assert not (Version.VER2 >= Version.FUTURE)
+    assert not (Version.VER2 > Version.FUTURE)
+
+    assert Version.VER1 < Version.VER2
+    assert Version.VER1 <= Version.VER2
+    assert Version.VER1 < Version.FUTURE
+    assert Version.VER1 <= Version.FUTURE
+    assert not (Version.FUTURE < Version.FUTURE)
+    assert not (Version.FUTURE <= Version.VER2)
+    assert not (Version.FUTURE < Version.VER2)
+
+
+def test_key_len():
+    with pytest.raises(misc.PdfError):
+        SecurityHandlerVersion.RC4_OR_AES128.check_key_length(20)
+    assert SecurityHandlerVersion.RC4_OR_AES128.check_key_length(6) == 6
+    assert SecurityHandlerVersion.AES256.check_key_length(6) == 32
+    assert SecurityHandlerVersion.RC4_40.check_key_length(32) == 5
+    assert SecurityHandlerVersion.RC4_LONGER_KEYS.check_key_length(16) == 16

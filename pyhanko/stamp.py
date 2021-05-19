@@ -17,8 +17,6 @@ from numbers import Rational
 import qrcode
 import tzlocal
 
-from pyhanko.pdf_utils.barcodes import PdfStreamQRImage
-from pyhanko.pdf_utils.images import PdfImage
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.misc import rd
 from pyhanko.pdf_utils.layout import BoxSpecificationError, BoxConstraints
@@ -33,6 +31,7 @@ from pyhanko.pdf_utils.generic import (
 )
 from pyhanko.pdf_utils.content import ResourceType, PdfContent, RawContent
 from pyhanko.pdf_utils.config_utils import ConfigurableMixin
+from pyhanko.pdf_utils.qr import PdfStreamQRImage
 
 
 __all__ = [
@@ -165,6 +164,7 @@ class TextStampStyle(ConfigurableMixin):
             if bg_spec == '__stamp__':
                 config_dict['background'] = STAMP_ART_CONTENT
             elif isinstance(bg_spec, str):
+                from pyhanko.pdf_utils.images import PdfImage
                 from PIL import Image
                 img = Image.open(bg_spec)
                 # Setting the writer can be delayed
