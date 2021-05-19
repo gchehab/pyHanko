@@ -8,7 +8,7 @@ CMS is defined in :rfc:`5652`. To parse CMS messages, pyHanko relies heavily on
 
 import logging
 from dataclasses import dataclass
-from typing import ClassVar, Set, Optional, Tuple
+from typing import ClassVar, Set, Optional, Tuple, Iterable
 
 import hashlib
 
@@ -22,25 +22,33 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 
-from certvalidator.path import ValidationPath
+from pyhanko.pdf_utils.config_utils import ConfigurableMixin, \
+    process_bit_string_flags, process_oids
+from pyhanko_certvalidator.path import ValidationPath
 
-from certvalidator import (
+from pyhanko_certvalidator import (
     CertificateValidator, InvalidCertificateError, PathBuildingError,
 )
-from certvalidator.errors import RevokedError, PathValidationError
+from pyhanko_certvalidator.errors import RevokedError, PathValidationError
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
 
 __all__ = [
     'SignatureStatus', 'simple_cms_attribute', 'find_cms_attribute',
-    'CertificateStore', 'SimpleCertificateStore', 'SigningError',
-    'UnacceptableSignerError',
+    'CertificateStore', 'SimpleCertificateStore',
+    'KeyUsageConstraints',
+    'SigningError', 'UnacceptableSignerError', 'WeakHashAlgorithmError',
+    'SignatureValidationError',
     'load_certs_from_pemder', 'load_cert_from_pemder',
-    'load_private_key_from_pemder'
+    'load_private_key_from_pemder', 'get_pyca_cryptography_hash',
+    'DEFAULT_WEAK_HASH_ALGORITHMS'
 ]
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_WEAK_HASH_ALGORITHMS = frozenset({'sha1', 'md5', 'md2'})
 
 
 class SignatureValidationError(ValueError):
@@ -48,71 +56,190 @@ class SignatureValidationError(ValueError):
     pass
 
 
+class WeakHashAlgorithmError(SignatureValidationError):
+    pass
+
+
+def _match_usages(required: set, present: set, need_all: bool):
+
+    if need_all:
+        return not (required - present)
+    else:
+        # intersection must be non-empty
+        return bool(required & present)
+
+
 @dataclass(frozen=True)
-class KeyUsageConstraints:
+class KeyUsageConstraints(ConfigurableMixin):
     """
     Convenience class to pass around key usage requirements and validate them.
+    Intended to be flexible enough to handle both PKIX and ISO 32000 certificate
+    seed value constraint semantics.
+
+    .. versionchanged:: 0.6.0
+        Bring extended key usage semantics in line with :rfc:`5280` (PKIX).
     """
 
     key_usage: Set[str] = None
     """
-    These key usage extensions must be present in the signer's certificate.
-    """
-
-    extd_key_usage: Set[str] = None
-    """
-    These extended key usage extensions must be present in the signer's
-    certificate.
+    All or some (depending on :attr:`match_all_key_usage`) of these key usage
+    extensions must be present in the signer's certificate.
+    If not set or empty, all key usages are considered acceptable.
     """
 
     key_usage_forbidden: Set[str] = None
     """
     These key usage extensions must not be present in the signer's certificate.
+    
+    .. note:: 
+        This behaviour is undefined in :rfc:`5280` (PKIX), but included for
+        compatibility with certificate seed value settings in ISO 32000.
     """
 
-    extd_key_usage_forbidden: Set[str] = None
+    extd_key_usage: Set[str] = None
     """
-    These extended key usage extensions must not be present in the signer's
-    certificate.
+    List of acceptable key purposes that can appear in an extended key 
+    usage extension in the signer's certificate, if such an extension is at all
+    present. If not set, all extended key usages are considered acceptable.
+    
+    If no extended key usage extension is present, or the
+    ``anyExtendedKeyUsage`` key purpose ID is present the resulting behaviour
+    depends on :attr:`explicit_extd_key_usage_required`.
+    
+    Setting this option to the empty set (as opposed to ``None``) effectively
+    bans all (presumably unrecognised) extended key usages.
+    
+    .. warning::
+        Note the difference in behaviour with :attr:`key_usage` for empty
+        sets of valid usages.
+    
+    .. warning::
+        Contrary to what some CAs seem to believe, the criticality of the     
+        extended key usage extension is irrelevant here.
+        Even a non-critical EKU extension **must** be enforced according to
+        :rfc:`5280` § 4.2.1.12.
+        
+        In practice, many certificate authorities issue non-repudiation certs
+        that can also be used for TLS authentication by only including the
+        TLS client authentication key purpose ID in the EKU extension.
+        Interpreted strictly, :rfc:`5280` bans such certificates from being
+        used to sign documents, and pyHanko will enforce these semantics
+        if :attr:`extd_key_usage` is not ``None``.
+    """
+
+    explicit_extd_key_usage_required: bool = True
+    """
+    .. versionadded:: 0.6.0
+    
+    Require an extended key usage extension with the right key usages to be
+    present if :attr:`extd_key_usage` is non-empty.
+    
+    If this flag is ``True``, at least one key purpose in :attr:`extd_key_usage`
+    must appear in the certificate's extended key usage, and
+    ``anyExtendedKeyUsage`` will be ignored.
+    """
+
+    match_all_key_usages: bool = False
+    """
+    .. versionadded:: 0.6.0
+    
+    If ``True``, all key usages indicated in :attr:`key_usage` must be present
+    in the certificate. If ``False``, one match suffices.
+    
+    If :attr:`key_usage` is empty or ``None``, this option has no effect.
     """
 
     def validate(self, cert: x509.Certificate):
+        self._validate_key_usage(cert.key_usage_value)
+        self._validate_extd_key_usage(cert.extended_key_usage_value)
 
-        # the PDF specification permits this type of "negative" constraint
-        # in seed value dictionaries.
-        # We have to validate these manually.
+    def _validate_key_usage(self, key_usage_extension_value):
+        if not self.key_usage:
+            return
         key_usage = self.key_usage or set()
-        extd_key_usage = self.extd_key_usage or set()
         key_usage_forbidden = self.key_usage_forbidden or set()
-        extd_key_usage_forbidden = self.extd_key_usage_forbidden or set()
+
+        # First, check the "regular" key usage extension
         cert_ku = (
-            set(cert.key_usage_value.native) if cert.key_usage_value is not None
-            else set()
-        )
-        cert_extd_ku = (
-            set(cert.extended_key_usage_value.native)
-            if cert.extended_key_usage_value is not None
-            else set()
+            set(key_usage_extension_value.native)
+            if key_usage_extension_value is not None else set()
         )
 
-        must_have = key_usage - cert_ku
-        must_have |= extd_key_usage - cert_extd_ku
-
-        forbidden = cert_ku & key_usage_forbidden
-        forbidden |= cert_extd_ku & extd_key_usage_forbidden
-
-        if must_have:
-            rephrased = map(lambda s: s.replace('_', ' '), must_have)
-            raise InvalidCertificateError(
-                "The active key usage policy requires the key extensions "
-                f"{', '.join(rephrased)} to be present."
-            )
-
-        if forbidden:
-            rephrased = map(lambda s: s.replace('_', ' '), forbidden)
+        # check blacklisted key usages (ISO 32k)
+        forbidden_ku = cert_ku & key_usage_forbidden
+        if forbidden_ku:
+            rephrased = map(lambda s: s.replace('_', ' '), forbidden_ku)
             raise InvalidCertificateError(
                 "The active key usage policy explicitly bans certificates "
                 f"used for {', '.join(rephrased)}."
+            )
+
+        # check required key usage extension values
+        need_all_ku = self.match_all_key_usages
+        if not _match_usages(key_usage, cert_ku, need_all_ku):
+            rephrased = map(lambda s: s.replace('_', ' '), key_usage)
+            raise InvalidCertificateError(
+                "The active key usage policy requires "
+                f"{'' if need_all_ku else 'at least one of '}the key "
+                f"usage extensions {', '.join(rephrased)} to be present."
+            )
+
+    def _validate_extd_key_usage(self, eku_extension_value):
+        if self.extd_key_usage is None:
+            return
+        # check extended key usage
+        has_extd_key_usage_ext = eku_extension_value is not None
+        cert_eku = (
+            set(eku_extension_value.native)
+            if has_extd_key_usage_ext else set()
+        )
+
+        if 'any_extended_key_usage' in cert_eku and \
+                not self.explicit_extd_key_usage_required:
+            return  # early out, cert is valid for all EKUs
+
+        extd_key_usage = self.extd_key_usage or set()
+        if not has_extd_key_usage_ext:
+            if self.explicit_extd_key_usage_required:
+                raise InvalidCertificateError(
+                    "The active key usage policy requires an extended "
+                    "key usage extension."
+                )
+            return  # early out, cert is (presumably?) valid for all EKUs
+
+        if not _match_usages(extd_key_usage, cert_eku, need_all=False):
+            if extd_key_usage:
+                rephrased = map(lambda s: s.replace('_', ' '), extd_key_usage)
+                ok_list = f"Relevant key purposes are {', '.join(rephrased)}."
+            else:
+                ok_list = "There are no acceptable extended key usages."
+            raise InvalidCertificateError(
+                "The extended key usages for which this certificate is valid "
+                f"do not match the active key usage policy. {ok_list}"
+            )
+
+    @classmethod
+    def process_entries(cls, config_dict):
+        super().process_entries(config_dict)
+
+        # Deal with KeyUsage values first
+        # might as well expose key_usage_forbidden while we're at it
+        for key_usage_sett in ('key_usage', 'key_usage_forbidden'):
+            affected_flags = config_dict.get(key_usage_sett, None)
+            if affected_flags is not None:
+                config_dict[key_usage_sett] = set(
+                    process_bit_string_flags(
+                        x509.KeyUsage, affected_flags,
+                        key_usage_sett.replace('_', '-')
+                    )
+                )
+
+        extd_key_usage = config_dict.get('extd_key_usage', None)
+        if extd_key_usage is not None:
+            config_dict['extd_key_usage'] = set(
+                process_oids(
+                    x509.KeyPurposeId, extd_key_usage, 'extd-key-usage'
+                )
             )
 
 
@@ -177,12 +304,15 @@ class SignatureStatus:
     """
     Class property indicating which key usage extensions are required to be
     present on the signer's certificate.
+    The default is ``non_repudiation`` only.
     """
 
-    extd_key_usage: ClassVar[Set[str]] = set()
+    extd_key_usage: ClassVar[Optional[Set[str]]] = None
     """
     Class property indicating which extended key usage extensions are required 
     to be present on the signer's certificate.
+    
+    See :attr:`.KeyUsageConstraints.extd_key_usage`.
     """
 
     def summary_fields(self):
@@ -224,7 +354,7 @@ class SignatureStatus:
         path = None
 
         try:
-            # validate usage without going through certvalidator
+            # validate usage without going through pyhanko_certvalidator
             key_usage_settings.validate(cert)
             path = validator.validate_usage(key_usage=set())
             trusted = True
@@ -340,9 +470,15 @@ class CertificateStore:
 
 class SimpleCertificateStore(CertificateStore):
     """
-    Unopinionated replacement for certvalidator's CertificateRegistry in cases
+    Unopinionated replacement for pyhanko_certvalidator's CertificateRegistry in cases
     where we explicitly don't care about whether the certs are trusted or not.
     """
+
+    @classmethod
+    def from_certs(cls, certs: Iterable[x509.Certificate]):
+        s = SimpleCertificateStore()
+        s.certs = {cert.issuer_serial: cert for cert in certs}
+        return s
 
     def __init__(self):
         self.certs = {}
@@ -371,7 +507,7 @@ class UnacceptableSignerError(SigningError):
     pass
 
 
-def _get_pyca_cryptography_hash(algorithm, prehashed=False):
+def get_pyca_cryptography_hash(algorithm, prehashed=False):
     hash_algo = getattr(hashes, algorithm.upper())()
     return Prehashed(hash_algo) if prehashed else hash_algo
 
@@ -400,8 +536,8 @@ def _process_pss_params(params: algos.RSASSAPSSParams, digest_algorithm,
         )
     salt_len: int = params['salt_length'].native
 
-    mgf_md = _get_pyca_cryptography_hash(mgf_md_name, prehashed=False)
-    md = _get_pyca_cryptography_hash(md_name, prehashed=prehashed)
+    mgf_md = get_pyca_cryptography_hash(mgf_md_name, prehashed=False)
+    md = get_pyca_cryptography_hash(md_name, prehashed=prehashed)
     pss_padding = padding.PSS(
         mgf=padding.MGF1(algorithm=mgf_md),
         salt_length=salt_len
@@ -413,20 +549,13 @@ def optimal_pss_params(cert: x509.Certificate, digest_algorithm: str):
 
     digest_algorithm = digest_algorithm.lower()
 
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
-    except ImportError:  # pragma: nocover
-        raise SigningError("pyca/cryptography is required for generic PSS")
-
     key: RSAPublicKey = serialization.load_der_public_key(
         cert.public_key.dump()
     )
-    md = getattr(hashes, digest_algorithm.upper())
+    md = get_pyca_cryptography_hash(digest_algorithm)
     # the PSS salt calculation function is not in the .pyi file, apparently.
     # noinspection PyUnresolvedReferences
-    optimal_salt_len = padding.calculate_max_pss_salt_length(key, md())
+    optimal_salt_len = padding.calculate_max_pss_salt_length(key, md)
     return algos.RSASSAPSSParams({
         'hash_algorithm': algos.DigestAlgorithm({
             'algorithm': digest_algorithm
@@ -540,13 +669,19 @@ def _translate_pyca_cryptography_cert_to_asn1(cert) -> x509.Certificate:
 
 def _validate_raw(signature: bytes, signed_data: bytes, cert: x509.Certificate,
                   signature_algorithm: cms.SignedDigestAlgorithm,
-                  md_algorithm: str, prehashed=False):
+                  md_algorithm: str, prehashed=False,
+                  weak_hash_algorithms=DEFAULT_WEAK_HASH_ALGORITHMS):
     try:
-        md_algorithm = signature_algorithm.hash_algo.upper()
+        sig_md_algorithm = signature_algorithm.hash_algo
     except (ValueError, AttributeError):
-        pass
+        sig_md_algorithm = None
 
-    verify_md = _get_pyca_cryptography_hash(md_algorithm, prehashed=prehashed)
+    if sig_md_algorithm is not None:
+        if sig_md_algorithm in weak_hash_algorithms:
+            raise WeakHashAlgorithmError(md_algorithm)
+        md_algorithm = sig_md_algorithm.upper()
+
+    verify_md = get_pyca_cryptography_hash(md_algorithm, prehashed=prehashed)
 
     pub_key = serialization.load_der_public_key(
         cert.public_key.dump()
@@ -572,10 +707,12 @@ def _validate_raw(signature: bytes, signed_data: bytes, cert: x509.Certificate,
         )
 
 
-def validate_sig_integrity(signer_info: cms.SignedData,
+def validate_sig_integrity(signer_info: cms.SignerInfo,
                            cert: x509.Certificate,
                            expected_content_type: str,
-                           actual_digest: bytes) -> Tuple[bool, bool]:
+                           actual_digest: bytes,
+                           weak_hash_algorithms=DEFAULT_WEAK_HASH_ALGORITHMS) \
+        -> Tuple[bool, bool]:
     """
     Validate the integrity of a signature for a particular signerInfo object
     inside a CMS signed data container.
@@ -597,6 +734,8 @@ def validate_sig_integrity(signer_info: cms.SignedData,
         see :class:`cms.ContentType`).
     :param actual_digest:
         The actual digest to be matched to the message digest attribute.
+    :param weak_hash_algorithms:
+        List, tuple or set of weak hashing algorithms.
     :return:
         A tuple of two booleans. The first indicates whether the provided
         digest matches the value in the signed attributes.
@@ -607,6 +746,8 @@ def validate_sig_integrity(signer_info: cms.SignedData,
         signer_info['signature_algorithm']
     digest_algorithm_obj = signer_info['digest_algorithm']
     md_algorithm = digest_algorithm_obj['algorithm'].native
+    if md_algorithm in weak_hash_algorithms:
+        raise WeakHashAlgorithmError(md_algorithm)
     signature = signer_info['signature'].native
 
     # signed_attrs comes with some context-specific tagging.
@@ -683,7 +824,7 @@ def validate_sig_integrity(signer_info: cms.SignedData,
     try:
         _validate_raw(
             signature, signed_data, cert, signature_algorithm, md_algorithm,
-            prehashed=prehashed
+            prehashed=prehashed, weak_hash_algorithms=weak_hash_algorithms
         )
         valid = True
     except InvalidSignature:

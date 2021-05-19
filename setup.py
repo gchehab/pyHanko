@@ -20,7 +20,7 @@ def get_version():
 setup(
     name='pyHanko',
     version=get_version(),
-    packages=['pyhanko', 'pyhanko.pdf_utils', 'pyhanko.sign'],
+    packages=['pyhanko', 'pyhanko.pdf_utils', 'pyhanko.sign', 'pyhanko.sign.ades'],
     url='https://github.com/MatthiasValvekens/pyHanko',
     license='MIT',
     author='Matthias Valvekens',
@@ -52,13 +52,10 @@ setup(
         'pytz>=2020.1',
         'qrcode>=6.1',
         'tzlocal>=2.1',
-        'python-pkcs11>=0.6.0',
-        'pyhanko-certvalidator==0.12.1',
+        'pyhanko-certvalidator==0.15.1',
         'fonttools>=4.13.0',
         'click>=7.1.2',
         'requests>=2.24.0',
-        'python-barcode>=0.13.1',
-        'Pillow>=8.0.1',
         'pyyaml>=5.3.1',
         'cryptography>=3.3.1'
     ],
@@ -66,13 +63,20 @@ setup(
         'wheel', 'pytest-runner'
     ],
     extras_require={
-        'extra_pubkey_algs': ['oscrypto>=1.2.1']
+        'extra_pubkey_algs': ['oscrypto>=1.2.1'],
+        'image-support': [
+            # Only tested systematically on 8.x,
+            # but we allow 7.2.x to support system PIL on Ubuntu
+            'Pillow>=7.2.0',
+            'python-barcode>=0.13.1',
+        ],
+        'pkcs11': ['python-pkcs11>=0.6.0']
     },
     tests_require=[
         'pytest>=6.1.1',
         'requests-mock>=1.8.0',
-        'ocspbuilder>=0.10.2',
         'freezegun',
+        'certomancer==0.5.0'
     ],
     keywords="signature pdf pades digital-signature pkcs11"
 )

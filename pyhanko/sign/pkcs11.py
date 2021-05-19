@@ -7,9 +7,17 @@ seamlessly plugged into a :class:`~.signers.PdfSigner`.
 import logging
 
 from asn1crypto.algos import RSASSAPSSParams
-from pkcs11 import (
-    Session, ObjectClass, Attribute, lib as pkcs11_lib, PKCS11Error
-)
+
+try:
+    from pkcs11 import (
+        Session, ObjectClass, Attribute, lib as pkcs11_lib, PKCS11Error
+    )
+except ImportError as e:  # pragma: nocover
+    raise ImportError(
+        "pyhanko.sign.pkcs11 requires pyHanko to be installed with "
+        "the [pkcs11] option. You can install missing "
+        "dependencies by running \"pip install 'pyHanko[pkcs11]'\".", e
+    )
 
 from typing import Set
 
@@ -64,7 +72,7 @@ def open_pkcs11_session(lib_location, slot_no=None, token_label=None,
     else:
         token = slots[slot_no].get_token()
         if token_label is not None and token.label != token_label:
-            raise PKCS11Error('Token in slot %d is not BELPIC.' % slot_no)
+            raise PKCS11Error(f'Token in slot {slot_no} is not {token_label}.')
 
     kwargs = {}
     if user_pin is not None:
@@ -265,7 +273,12 @@ class PKCS11Signer(Signer):
             Attribute.LABEL: self.key_label,
             Attribute.CLASS: ObjectClass.PRIVATE_KEY
         })
-        kh, = list(q)
+        try:
+            kh, = list(q)
+        except ValueError as e:
+            raise PKCS11Error(
+                "Could not determine private key handle."
+            ) from e
         if not kh[Attribute.SIGN]:
             logger.warning(
                 f"The PKCS#11 device reports that the key with label "

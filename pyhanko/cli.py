@@ -6,27 +6,24 @@ import click
 import logging
 import getpass
 
-from certvalidator import ValidationContext
+from pyhanko_certvalidator import ValidationContext
 from pyhanko.config import (
     init_validation_context_kwargs, parse_cli_config,
     CLIConfig, LogConfig, StdLogOutput, parse_logging_config
 )
 from pyhanko.pdf_utils import misc
 from pyhanko.pdf_utils.config_utils import ConfigurationError
-from pyhanko.pdf_utils.crypt import (
-    SimpleEnvelopeKeyDecrypter,
-    PubKeySecurityHandler, AuthStatus,
-)
 
-from pyhanko.sign import signers, pkcs11
+from pyhanko.sign import signers, validation, fields
 from pyhanko.sign.general import (
     SigningError, SignatureValidationError, load_certs_from_pemder
 )
+from pyhanko.sign.signers import DEFAULT_SIGNER_KEY_USAGE
 from pyhanko.sign.timestamps import HTTPTimeStamper
-from pyhanko.sign import validation, beid, fields
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.pdf_utils.writer import copy_into_new_writer
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+from pyhanko.pdf_utils import crypt
 from pyhanko.sign.validation import (
     RevocationInfoValidationType
 )
@@ -37,6 +34,13 @@ __all__ = ['cli']
 
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    import pkcs11  # lgtm [py/unused-import]
+    pkcs11_available = True
+except ImportError:
+    pkcs11_available = False
 
 
 def logging_setup(log_configs):
@@ -170,10 +174,16 @@ readable_file = click.Path(exists=True, readable=True, dir_okay=False)
 
 
 def _build_vc_kwargs(ctx, validation_context, trust,
-                     trust_replace, other_certs, allow_fetching=None):
+                     trust_replace, other_certs, retroactive_revinfo,
+                     allow_fetching=None):
     cli_config: CLIConfig = ctx.obj.get(Ctx.CLI_CONFIG, None)
     try:
         if validation_context is not None:
+            if any((trust, other_certs)):
+                raise click.ClickException(
+                    "--validation-context is incompatible with --trust "
+                    "and --other-certs"
+                )
             # load the desired context from config
             if cli_config is None:
                 raise click.ClickException("No config file specified.")
@@ -192,7 +202,9 @@ def _build_vc_kwargs(ctx, validation_context, trust,
         elif trust or other_certs:
             # load a validation profile using command line kwargs
             result = init_validation_context_kwargs(
-                trust, trust_replace, other_certs
+                trust=trust, trust_replace=trust_replace,
+                other_certs=other_certs,
+                retroactive_revinfo=retroactive_revinfo
             )
         elif cli_config is not None:
             # load the default settings from the CLI config
@@ -209,7 +221,13 @@ def _build_vc_kwargs(ctx, validation_context, trust,
 
         if allow_fetching is not None:
             result['allow_fetching'] = allow_fetching
+        else:
+            result.setdefault('allow_fetching', True)
 
+        # allow CLI --retroactive-revinfo flag to override settings
+        # if necessary
+        if retroactive_revinfo:
+            result['retroactive_revinfo'] = True
         return result
     except click.ClickException:
         raise
@@ -221,6 +239,18 @@ def _build_vc_kwargs(ctx, validation_context, trust,
         msg = "Generic processing problem while reading validation config"
         logger.error(msg, exc_info=e)
         raise click.ClickException(msg)
+
+
+def _get_key_usage_settings(ctx, validation_context):
+    cli_config: CLIConfig = ctx.obj.get(Ctx.CLI_CONFIG, None)
+    if cli_config is None:
+        return None
+
+    # note: validation_context can be None, this triggers fallback to the
+    # default validation context specified in the configuration file
+    # If we add support for specifying key usage settings as CLI arguments,
+    # using the same fallbacks as _build_cli_kwargs would probably be cleaner
+    return cli_config.get_signer_key_usages(name=validation_context)
 
 
 def trust_options(f):
@@ -276,20 +306,33 @@ def _select_style(ctx, style_name, url):
     return style
 
 
-def _signature_status(ltv_profile, ltv_obsessive,
-                      pretty_print, vc_kwargs,
+def _signature_status(ltv_profile, force_revinfo, soft_revocation_check,
+                      pretty_print, vc_kwargs, key_usage_settings,
                       executive_summary, embedded_sig):
+    if soft_revocation_check and force_revinfo:
+        raise click.ClickException(
+            "--soft-revocation-check is incompatible with "
+            "--force-revinfo"
+        )
+    if force_revinfo:
+        rev_mode = 'require'
+    elif soft_revocation_check:
+        rev_mode = 'soft-fail'
+    else:
+        rev_mode = 'hard-fail'
+    vc_kwargs['revocation_mode'] = rev_mode
     try:
         if ltv_profile is None:
             vc = ValidationContext(**vc_kwargs)
             status = validation.validate_pdf_signature(
-                embedded_sig,
+                embedded_sig, key_usage_settings=key_usage_settings,
                 signer_validation_context=vc
             )
         else:
             status = validation.validate_pdf_ltv_signature(
                 embedded_sig, ltv_profile,
-                force_revinfo=ltv_obsessive,
+                key_usage_settings=key_usage_settings,
+                force_revinfo=force_revinfo,
                 validation_context_kwargs=vc_kwargs
             )
         if executive_summary and not pretty_print:
@@ -303,7 +346,7 @@ def _signature_status(ltv_profile, ltv_obsessive,
             'An error occurred while parsing the revocation information '
             'for this signature: ' + str(e)
         )
-        logger.error(msg, exc_info=e)
+        logger.error(msg)
         if pretty_print:
             return msg
         else:
@@ -315,13 +358,6 @@ def _signature_status(ltv_profile, ltv_obsessive,
             return msg
         else:
             return 'INVALID'
-    except Exception as e:
-        msg = 'Generic processing error: ' + str(e)
-        logger.error(msg, exc_info=e)
-        if pretty_print:
-            return msg
-        else:
-            return 'MALFORMED'
 
 
 # TODO add an option to do LTV, but guess the profile
@@ -338,14 +374,33 @@ def _signature_status(ltv_profile, ltv_obsessive,
               help='LTV signature validation profile',
               type=click.Choice(RevocationInfoValidationType.as_tuple()),
               required=False)
-@click.option('--ltv-obsessive',
+@click.option('--force-revinfo',
               help='Fail trust validation if a certificate has no known CRL '
                    'or OCSP endpoints.',
               type=bool, is_flag=True, default=False, show_default=True)
+@click.option('--soft-revocation-check',
+              help='Do not fail validation on revocation checking failures '
+                   '(only applied to on-line revocation checks)',
+              type=bool, is_flag=True, default=False, show_default=True)
+@click.option('--no-revocation-check',
+              help='Do not attempt to check revocation status '
+                   '(meaningless for LTV validation)',
+              type=bool, is_flag=True, default=False, show_default=True)
+@click.option('--retroactive-revinfo',
+              help='Treat revocation info as retroactively valid '
+                   '(i.e. ignore thisUpdate timestamp)',
+              type=bool, is_flag=True, default=False, show_default=True)
+@click.option('--password', required=False, type=str,
+              help='password to access the file (can also be read from stdin)')
 @click.pass_context
 def validate_signatures(ctx, infile, executive_summary,
                         pretty_print, validation_context, trust, trust_replace,
-                        other_certs, ltv_profile, ltv_obsessive):
+                        other_certs, ltv_profile, force_revinfo,
+                        soft_revocation_check, no_revocation_check, password,
+                        retroactive_revinfo):
+
+    if no_revocation_check:
+        soft_revocation_check = True
 
     if pretty_print and executive_summary:
         raise click.ClickException(
@@ -356,23 +411,32 @@ def validate_signatures(ctx, infile, executive_summary,
         ltv_profile = RevocationInfoValidationType(ltv_profile)
 
     vc_kwargs = _build_vc_kwargs(
-        ctx, validation_context, trust, trust_replace, other_certs
+        ctx, validation_context, trust, trust_replace, other_certs,
+        retroactive_revinfo,
+        allow_fetching=False if no_revocation_check else None
     )
+
+    key_usage_settings = _get_key_usage_settings(ctx, validation_context)
     with pyhanko_exception_manager():
         r = PdfFileReader(infile)
+        sh = r.security_handler
+        if isinstance(sh, crypt.StandardSecurityHandler):
+            if password is None:
+                password = getpass.getpass(prompt='File password: ')
+            auth_result = r.decrypt(password)
+            if auth_result.status == crypt.AuthStatus.FAILED:
+                raise click.ClickException("Password didn't match.")
+        elif sh is not None:
+            raise click.ClickException(
+                "The CLI supports only password-based encryption when "
+                "validating (for now)"
+            )
 
-        # function to filter out timestamps
-        def is_sig(sig):
-            try:
-                return sig.sig_object['/Type'] == '/Sig'
-            except KeyError:
-                return True
-
-        sigs = filter(is_sig, r.embedded_signatures)
-        for ix, embedded_sig in enumerate(sigs):
+        for ix, embedded_sig in enumerate(r.embedded_regular_signatures):
             fingerprint: str = embedded_sig.signer_cert.sha256.hex()
             status_str = _signature_status(
-                ltv_profile, ltv_obsessive, pretty_print, vc_kwargs,
+                ltv_profile, force_revinfo, soft_revocation_check,
+                pretty_print, vc_kwargs, key_usage_settings,
                 executive_summary, embedded_sig
             )
             name = embedded_sig.field_name
@@ -408,18 +472,74 @@ def list_sigfields(infile, skip_status):
 @click.argument('infile', type=click.File('r+b'))
 @click.option('--timestamp-url', help='URL for timestamp server',
               required=True, type=str, default=None)
+@click.option('--retroactive-revinfo',
+              help='Treat revocation info as retroactively valid '
+                   '(i.e. ignore thisUpdate timestamp)',
+              type=bool, is_flag=True, default=False, show_default=True)
 @trust_options
 @click.pass_context
 def lta_update(ctx, infile, validation_context, trust, trust_replace,
-               other_certs, timestamp_url):
+               other_certs, timestamp_url, retroactive_revinfo):
     with pyhanko_exception_manager():
         vc_kwargs = _build_vc_kwargs(
-            ctx, validation_context, trust, trust_replace, other_certs
+            ctx, validation_context, trust, trust_replace, other_certs,
+            retroactive_revinfo
         )
         timestamper = HTTPTimeStamper(timestamp_url)
         r = PdfFileReader(infile)
         signers.PdfTimeStamper(timestamper).update_archival_timestamp_chain(
             r, ValidationContext(**vc_kwargs)
+        )
+
+
+# TODO perhaps add an option here to fix the lack of a timestamp and/or
+#  warn if none is present
+
+@signing.command(name='ltvfix',
+                 help='add revocation information for a signature to the '
+                      'document security store')
+@click.argument('infile', type=click.File('r+b'))
+@click.option('--field', help='name of the signature field', required=True)
+@click.option('--timestamp-url', help='URL for timestamp server',
+              required=False, type=str, default=None)
+@click.option('--apply-lta-timestamp',
+              help='Apply a document timestamp after adding revocation info.',
+              required=False, type=bool, default=False, is_flag=True,
+              show_default=True)
+@trust_options
+@click.pass_context
+def ltv_fix(ctx, infile, field, timestamp_url, apply_lta_timestamp,
+            validation_context, trust_replace, trust, other_certs):
+    if apply_lta_timestamp and not timestamp_url:
+        raise click.ClickException(
+            "Please specify a timestamp server using --timestamp-url."
+        )
+
+    vc_kwargs = _build_vc_kwargs(
+        ctx, validation_context, trust, trust_replace, other_certs,
+        retroactive_revinfo=False, allow_fetching=True
+    )
+    vc_kwargs['revocation_mode'] = 'hard-fail'
+    r = PdfFileReader(infile)
+
+    try:
+        emb_sig = next(
+            s for s in r.embedded_regular_signatures if s.field_name == field
+        )
+    except StopIteration:
+        raise click.ClickException(
+            f"Could not find a PDF signature labelled {field}."
+        )
+
+    output = validation.add_validation_info(
+        emb_sig, ValidationContext(**vc_kwargs), in_place=True
+    )
+
+    if apply_lta_timestamp:
+        timestamper = HTTPTimeStamper(timestamp_url)
+        signers.PdfTimeStamper(timestamper).timestamp_pdf(
+            IncrementalPdfFileWriter(output), signers.DEFAULT_MD,
+            ValidationContext(**vc_kwargs), in_place=True
         )
 
 
@@ -452,11 +572,15 @@ def lta_update(ctx, infile, validation_context, trust, trust_replace,
     required=False, type=str
 )
 @trust_options
+@click.option('--retroactive-revinfo',
+              help='Treat revocation info as retroactively valid '
+                   '(i.e. ignore thisUpdate timestamp)',
+              type=bool, is_flag=True, default=False, show_default=True)
 @click.pass_context
 def addsig(ctx, field, name, reason, location, certify, existing_only,
            timestamp_url, use_pades, with_validation_info,
            validation_context, trust_replace, trust, other_certs,
-           style_name, stamp_url, prefer_pss):
+           style_name, stamp_url, prefer_pss, retroactive_revinfo):
     ctx.obj[Ctx.EXISTING_ONLY] = existing_only or field is None
     ctx.obj[Ctx.TIMESTAMP_URL] = timestamp_url
     ctx.obj[Ctx.PREFER_PSS] = prefer_pss
@@ -466,12 +590,16 @@ def addsig(ctx, field, name, reason, location, certify, existing_only,
     else:
         subfilter = fields.SigSeedSubFilter.ADOBE_PKCS7_DETACHED
 
+    key_usage = DEFAULT_SIGNER_KEY_USAGE
     if with_validation_info:
         vc_kwargs = _build_vc_kwargs(
             ctx, validation_context, trust, trust_replace, other_certs,
-            allow_fetching=True
+            retroactive_revinfo, allow_fetching=True
         )
         vc = ValidationContext(**vc_kwargs)
+        key_usage_sett = _get_key_usage_settings(ctx, validation_context)
+        if key_usage_sett is not None and key_usage_sett.key_usage is not None:
+            key_usage = key_usage_sett.key_usage
     else:
         vc = None
     field_name, new_field_spec = parse_field_location_spec(
@@ -481,7 +609,7 @@ def addsig(ctx, field, name, reason, location, certify, existing_only,
         field_name=field_name, location=location, reason=reason, name=name,
         certify=certify, subfilter=subfilter,
         embed_validation_info=with_validation_info,
-        validation_context=vc
+        validation_context=vc, signer_key_usage=key_usage
     )
     ctx.obj[Ctx.NEW_FIELD_SPEC] = new_field_spec
     ctx.obj[Ctx.STAMP_STYLE] = _select_style(ctx, style_name, stamp_url)
@@ -489,7 +617,6 @@ def addsig(ctx, field, name, reason, location, certify, existing_only,
 
 
 def _open_for_signing(infile_path, signer_cert=None, signer_key=None):
-    from pyhanko.pdf_utils import crypt
     infile = open(infile_path, 'rb')
     writer = IncrementalPdfFileWriter(infile)
 
@@ -505,7 +632,7 @@ def _open_for_signing(infile_path, signer_cert=None, signer_key=None):
         elif isinstance(sh, crypt.PubKeySecurityHandler) \
                 and signer_key is not None:
             # attempt to decrypt using signer's credentials
-            cred = SimpleEnvelopeKeyDecrypter(signer_cert, signer_key)
+            cred = crypt.SimpleEnvelopeKeyDecrypter(signer_cert, signer_key)
             logger.warning(
                 "The file \'%s\' appears to be encrypted using public-key "
                 "encryption. This is only partially supported in pyHanko's "
@@ -642,7 +769,7 @@ def addsig_pkcs12(ctx, infile, outfile, pfx, chain, passfile):
     timestamp_url = ctx.obj[Ctx.TIMESTAMP_URL]
 
     if passfile is None:
-        passphrase = getpass.getpass(prompt='Export passphrase: ')\
+        passphrase = getpass.getpass(prompt='PKCS#12 passphrase: ')\
                         .encode('utf-8')
     else:
         passphrase = passfile.read()
@@ -663,7 +790,6 @@ def addsig_pkcs12(ctx, infile, outfile, pfx, chain, passfile):
 
 # TODO add options to specify extra certs to include
 
-@addsig.command(name='pkcs11', help='use generic PKCS#11 device to sign')
 @click.argument('infile', type=click.File('rb'))
 @click.argument('outfile', type=click.File('wb'))
 @click.option('--lib', help='path to PKCS#11 module',
@@ -680,6 +806,7 @@ def addsig_pkcs12(ctx, infile, outfile, pfx, chain, passfile):
 @click.pass_context
 def addsig_pkcs11(ctx, infile, outfile, lib, token_label,
                   cert_label, key_label, slot_no, skip_user_pin):
+    from pyhanko.sign import pkcs11
     signature_meta = ctx.obj[Ctx.SIG_META]
     existing_fields_only = ctx.obj[Ctx.EXISTING_ONLY]
     timestamp_url = ctx.obj[Ctx.TIMESTAMP_URL]
@@ -713,7 +840,6 @@ def addsig_pkcs11(ctx, infile, outfile, lib, token_label,
         )
 
 
-@addsig.command(name='beid', help='use Belgian eID to sign')
 @click.argument('infile', type=click.File('rb'))
 @click.argument('outfile', type=click.File('wb'))
 @click.option('--lib', help='path to libbeidpkcs11 library file',
@@ -725,6 +851,7 @@ def addsig_pkcs11(ctx, infile, outfile, lib, token_label,
               required=False, type=int, default=None)
 @click.pass_context
 def addsig_beid(ctx, infile, outfile, lib, use_auth_cert, slot_no):
+    from pyhanko.sign import beid
     signature_meta = ctx.obj[Ctx.SIG_META]
     existing_fields_only = ctx.obj[Ctx.EXISTING_ONLY]
     timestamp_url = ctx.obj[Ctx.TIMESTAMP_URL]
@@ -745,6 +872,27 @@ def addsig_beid(ctx, infile, outfile, lib, use_auth_cert, slot_no):
             existing_fields_only=existing_fields_only,
             text_params=get_text_params(ctx)
         )
+
+
+def _pkcs11_cmd(name, hlp, fun):
+    addsig.command(name=name, help=hlp)(fun)
+
+
+PKCS11_COMMANDS = [
+    ('pkcs11', 'use generic PKCS#11 device to sign', addsig_pkcs11),
+    ('beid', 'use Belgian eID to sign', addsig_beid)
+]
+
+if pkcs11_available:
+    for args in PKCS11_COMMANDS:
+        _pkcs11_cmd(*args)
+else:
+    def _unavailable():
+        raise click.ClickException(
+            "This subcommand requires python-pkcs11 to be installed."
+        )
+    for name, hlp, fun in PKCS11_COMMANDS:
+        _pkcs11_cmd(name, hlp + ' [dependencies missing]', _unavailable)
 
 
 def _index_page(page):
@@ -868,10 +1016,12 @@ def stamp(ctx, infile, outfile, x, y, style_name, page, stamp_url):
     type=click.Path(readable=True, dir_okay=False)
 )
 def encrypt_file(infile, outfile, password, recipient):
-    if bool(password) == bool(recipient):
+    if password and recipient:
         raise click.ClickException(
             "Specify either a password or a list of recipients."
         )
+    elif not password and not recipient:
+        password = getpass.getpass(prompt='Output file password: ')
 
     recipient_certs = None
     if recipient:
@@ -922,13 +1072,13 @@ def decrypt_with_password(infile, outfile, password, force):
             if not password:
                 password = getpass.getpass(prompt='File password: ')
             auth_result = r.decrypt(password)
-            if auth_result.status == AuthStatus.USER and not force:
+            if auth_result.status == crypt.AuthStatus.USER and not force:
                 raise click.ClickException(
                     "Password specified was the user password, not "
                     "the owner password. Pass --force to decrypt the "
                     "file anyway."
                 )
-            elif auth_result.status == AuthStatus.FAILED:
+            elif auth_result.status == crypt.AuthStatus.FAILED:
                 raise click.ClickException("Password didn't match.")
             w = copy_into_new_writer(r)
             with open(outfile, 'wb') as outf:
@@ -952,23 +1102,26 @@ def decrypt_with_pemder(infile, outfile, key, cert, passfile, force):
     else:
         passphrase = passfile.read()
         passfile.close()
-    sedk = SimpleEnvelopeKeyDecrypter.load(key, cert, key_passphrase=passphrase)
+    sedk = crypt.SimpleEnvelopeKeyDecrypter.load(
+        key, cert, key_passphrase=passphrase
+    )
 
     _decrypt_pubkey(sedk, infile, outfile, force)
 
 
-def _decrypt_pubkey(sedk: SimpleEnvelopeKeyDecrypter, infile, outfile, force):
+def _decrypt_pubkey(sedk: crypt.SimpleEnvelopeKeyDecrypter, infile, outfile,
+                    force):
     with pyhanko_exception_manager():
         with open(infile, 'rb') as inf:
             r = PdfFileReader(inf)
             if r.security_handler is None:
                 raise click.ClickException("File is not encrypted.")
-            if not isinstance(r.security_handler, PubKeySecurityHandler):
+            if not isinstance(r.security_handler, crypt.PubKeySecurityHandler):
                 raise click.ClickException(
                     "File was not encrypted with a public-key security handler."
                 )
             auth_result = r.decrypt_pubkey(sedk)
-            if auth_result.status == AuthStatus.USER:
+            if auth_result.status == crypt.AuthStatus.USER:
                 # TODO read 2nd bit of perms in CMS enveloped data
                 #  is the one indicating that change of encryption is OK
                 if not force:
@@ -976,7 +1129,7 @@ def _decrypt_pubkey(sedk: SimpleEnvelopeKeyDecrypter, infile, outfile, force):
                         "Change of encryption is typically not allowed with "
                         "user access. Pass --force to decrypt the file anyway."
                     )
-            elif auth_result.status == AuthStatus.FAILED:
+            elif auth_result.status == crypt.AuthStatus.FAILED:
                 raise click.ClickException("Failed to decrypt the file.")
             w = copy_into_new_writer(r)
             with open(outfile, 'wb') as outf:
@@ -997,6 +1150,8 @@ def decrypt_with_pkcs12(infile, outfile, pfx, passfile, force):
     else:
         passphrase = passfile.read()
         passfile.close()
-    sedk = SimpleEnvelopeKeyDecrypter.load_pkcs12(pfx, passphrase=passphrase)
+    sedk = crypt.SimpleEnvelopeKeyDecrypter.load_pkcs12(
+        pfx, passphrase=passphrase
+    )
 
     _decrypt_pubkey(sedk, infile, outfile, force)

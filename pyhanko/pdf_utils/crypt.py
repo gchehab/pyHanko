@@ -60,7 +60,7 @@ import secrets
 import enum
 from dataclasses import dataclass
 from hashlib import md5, sha256, sha384, sha512, sha1
-from typing import Dict, Type, Optional, Tuple, Union, List, Set
+from typing import Dict, Type, Optional, Tuple, Union, List, Set, Callable
 
 from asn1crypto import x509, cms, algos
 from asn1crypto.keys import PublicKeyAlgorithm, PrivateKeyInfo
@@ -81,8 +81,8 @@ __all__ = [
     'RC4CryptFilterMixin', 'AESCryptFilterMixin', 'StandardAESCryptFilter',
     'StandardRC4CryptFilter', 'PubKeyAESCryptFilter', 'PubKeyRC4CryptFilter',
     'EnvelopeKeyDecrypter', 'SimpleEnvelopeKeyDecrypter',
-    'STD_CF', 'DEFAULT_CRYPT_FILTER', 'IDENTITY',
-    'legacy_derive_object_key'
+    'STD_CF', 'DEFAULT_CRYPT_FILTER', 'IDENTITY', 'legacy_derive_object_key',
+    'CryptFilterBuilder', 'build_crypt_filter'
 ]
 
 logger = logging.getLogger(__name__)
@@ -418,7 +418,7 @@ class AuthResult:
 
 
 @enum.unique
-class SecurityHandlerVersion(misc.OrderedEnum):
+class SecurityHandlerVersion(misc.VersionEnum):
     """
     Indicates the security handler's version.
 
@@ -434,6 +434,28 @@ class SecurityHandlerVersion(misc.OrderedEnum):
     """
     Placeholder value for custom security handlers.
     """
+
+    def as_pdf_object(self) -> generic.PdfObject:
+        val = self.value
+        return generic.NullObject() if val is None \
+            else generic.NumberObject(val)
+
+    @classmethod
+    def from_number(cls, value) -> 'SecurityHandlerVersion':
+        try:
+            return SecurityHandlerVersion(value)
+        except ValueError:
+            return SecurityHandlerVersion.OTHER
+
+    def check_key_length(self, key_length: int) -> int:
+        if self == SecurityHandlerVersion.RC4_40:
+            return 5
+        elif self == SecurityHandlerVersion.AES256:
+            return 32
+        elif not (5 <= key_length <= 16) \
+                and self <= SecurityHandlerVersion.RC4_OR_AES128:
+            raise misc.PdfError("Key length must be between 5 and 16")
+        return key_length
 
 
 class SecurityHandler:
@@ -470,26 +492,26 @@ class SecurityHandler:
     """
 
     __registered_subclasses: Dict[str, Type['SecurityHandler']] = dict()
+    _known_crypt_filters = dict()
 
     def __init__(self, version: SecurityHandlerVersion, legacy_keylen,
                  crypt_filter_config: 'CryptFilterConfiguration',
                  encrypt_metadata=True):
         self.version = version
-        if version == SecurityHandlerVersion.RC4_40:
-            legacy_keylen = 5
-        elif not (5 <= legacy_keylen <= 16) \
-                and version <= SecurityHandlerVersion.RC4_OR_AES128:
-            raise misc.PdfError("Key length must be between 5 and 16")
-        elif version == SecurityHandlerVersion.AES256:
-            legacy_keylen = 32
-
         if crypt_filter_config is None:
             raise misc.PdfError("No crypt filter configuration")
         crypt_filter_config.set_security_handler(self)
 
-        self.keylen = legacy_keylen
+        self.keylen = version.check_key_length(legacy_keylen)
         self.crypt_filter_config = crypt_filter_config
         self.encrypt_metadata = encrypt_metadata
+
+    def __init_subclass__(cls, **kwargs):
+        # ensure that _known_crypt_filters is initialised to a fresh object
+        # (to ensure that registering new crypt filters with subclasses doesn't
+        # affect other classes in the hierarchy)
+        if '_known_crypt_filters' not in cls.__dict__:
+            cls._known_crypt_filters = dict(cls._known_crypt_filters)
 
     @staticmethod
     def register(cls: Type['SecurityHandler']):
@@ -641,15 +663,82 @@ class SecurityHandler:
     def get_file_encryption_key(self) -> bytes:
         raise NotImplementedError
 
+    @classmethod
+    def read_cf_dictionary(cls, cfdict: generic.DictionaryObject,
+                           acts_as_default: bool) -> Optional['CryptFilter']:
+        """
+        Interpret a crypt filter dictionary for this type of security handler.
+
+        :param cfdict:
+            A crypt filter dictionary.
+        :param acts_as_default:
+            Indicates whether this filter is intended to be used in
+            ``/StrF`` or ``/StmF``.
+        :return:
+            An appropriate :class:`.CryptFilter` object, or ``None``
+            if the crypt filter uses the ``/None`` method.
+        :raise NotImplementedError:
+            Raised when the crypt filter's ``/CFM`` entry indicates an unknown
+            crypt filter method.
+        """
+        # TODO does a V4 handler default to /Identity unless the /Encrypt
+        #  dictionary specifies a custom filter?
+        return build_crypt_filter(
+            cls._known_crypt_filters, cfdict, acts_as_default
+        )
+
+    @classmethod
+    def process_crypt_filters(cls, encrypt_dict: generic.DictionaryObject) \
+            -> Optional['CryptFilterConfiguration']:
+
+        stmf = encrypt_dict.get('/StmF', IDENTITY)
+        strf = encrypt_dict.get('/StrF', IDENTITY)
+        eff = encrypt_dict.get('/EFF', stmf)
+
+        try:
+            cf_config_dict = encrypt_dict['/CF']
+        except KeyError:
+            return None
+
+        crypt_filters = {
+            name: cls.read_cf_dictionary(cfdict, name in (stmf, strf))
+            for name, cfdict in cf_config_dict.items()
+        }
+        return CryptFilterConfiguration(
+            crypt_filters=crypt_filters, default_stream_filter=stmf,
+            default_string_filter=strf, default_file_filter=eff
+        )
+
+    @classmethod
+    def register_crypt_filter(cls, method: generic.NameObject,
+                              factory: 'CryptFilterBuilder'):
+        cls._known_crypt_filters[method] = factory
+
 
 @enum.unique
-class StandardSecuritySettingsRevision(misc.OrderedEnum):
+class StandardSecuritySettingsRevision(misc.VersionEnum):
     """Indicate the standard security handler revision to emulate."""
 
     RC4_BASIC = 2
     RC4_EXTENDED = 3
     RC4_OR_AES128 = 4
     AES256 = 6
+    OTHER = None
+    """
+    Placeholder value for custom security handlers.
+    """
+
+    def as_pdf_object(self) -> generic.PdfObject:
+        val = self.value
+        return generic.NullObject() if val is None \
+            else generic.NumberObject(val)
+
+    @classmethod
+    def from_number(cls, value) -> 'StandardSecuritySettingsRevision':
+        try:
+            return StandardSecuritySettingsRevision(value)
+        except ValueError:
+            return StandardSecuritySettingsRevision.OTHER
 
 
 class CryptFilter:
@@ -854,7 +943,7 @@ class PubKeyCryptFilter(CryptFilter, abc.ABC):
         Whether this crypt filter should encrypt document-level metadata.
 
         .. warning::
-            See :class:`.SecurityHandlers` for some background on the
+            See :class:`.SecurityHandler` for some background on the
             way pyHanko interprets this value.
     """
     _handler: 'PubKeySecurityHandler' = None
@@ -1388,6 +1477,52 @@ def _pubkey_aes_config(keylen, recipients=None, encrypt_metadata=True):
     )
 
 
+CryptFilterBuilder = Callable[[generic.DictionaryObject, bool], CryptFilter]
+"""
+Type alias for a callable that produces a crypt filter from a dictionary.
+"""
+
+
+def build_crypt_filter(reg: Dict[generic.NameObject, CryptFilterBuilder],
+                       cfdict: generic.DictionaryObject,
+                       acts_as_default: bool) -> Optional[CryptFilter]:
+    """
+    Interpret a crypt filter dictionary for a security handler.
+
+    :param reg:
+        A registry of named crypt filters.
+    :param cfdict:
+        A crypt filter dictionary.
+    :param acts_as_default:
+        Indicates whether this filter is intended to be used in
+        ``/StrF`` or ``/StmF``.
+    :return:
+        An appropriate :class:`.CryptFilter` object, or ``None``
+        if the crypt filter uses the ``/None`` method.
+    :raise NotImplementedError:
+        Raised when the crypt filter's ``/CFM`` entry indicates an unknown
+        crypt filter method.
+    """
+
+    try:
+        cfm = cfdict['/CFM']
+    except KeyError:
+        return None
+    if cfm == '/None':
+        return None
+    try:
+        factory = reg[cfm]
+    except KeyError:
+        raise NotImplementedError("No such crypt filter method: " + cfm)
+    return factory(cfdict, acts_as_default)
+
+
+def _build_legacy_standard_crypt_filter(cfdict: generic.DictionaryObject,
+                                        _acts_as_default):
+    keylen_bits = cfdict.get('/Length', 40)
+    return StandardRC4CryptFilter(keylen=keylen_bits // 8)
+
+
 @SecurityHandler.register
 class StandardSecurityHandler(SecurityHandler):
     """
@@ -1401,6 +1536,13 @@ class StandardSecurityHandler(SecurityHandler):
     security handlers through :meth:`.SecurityHandler.build`.
     """
 
+    _known_crypt_filters: Dict[generic.NameObject, CryptFilterBuilder] = {
+        '/V2': _build_legacy_standard_crypt_filter,
+        '/AESV2': lambda _, __: StandardAESCryptFilter(keylen=16),
+        '/AESV3': lambda _, __: StandardAESCryptFilter(keylen=32),
+        '/Identity': lambda _, __: IdentityCryptFilter()
+    }
+
     @classmethod
     def get_name(cls) -> str:
         return generic.NameObject('/Standard')
@@ -1410,10 +1552,11 @@ class StandardSecurityHandler(SecurityHandler):
                              id1, desired_owner_pass, desired_user_pass=None,
                              keylen_bytes=16, use_aes128=True,
                              perms: int = ALL_PERMS,
-                             crypt_filter_config=None):
+                             crypt_filter_config=None, **kwargs):
         """
         Initialise a legacy password-based security handler, to attach to a
         :class:`~.pyhanko.pdf_utils.writer.PdfFileWriter`.
+        Any remaining keyword arguments will be passed to the constructor.
 
         .. danger::
             The functionality implemented by this handler is deprecated in the
@@ -1486,22 +1629,25 @@ class StandardSecurityHandler(SecurityHandler):
             else:
                 crypt_filter_config = _std_rc4_config(keylen=keylen_bytes)
 
-        sh = StandardSecurityHandler(
+        sh = cls(
             version=version, revision=rev, legacy_keylen=keylen_bytes,
             perm_flags=perms, odata=o_entry,
             udata=u_entry, encrypt_metadata=True,
             crypt_filter_config=crypt_filter_config,
+            **kwargs
         )
         sh._shared_key = key
         return sh
 
     @classmethod
     def build_from_pw(cls, desired_owner_pass, desired_user_pass=None,
-                      perms=ALL_PERMS):
+                      perms=ALL_PERMS, **kwargs):
         """
         Initialise a password-based security handler backed by AES-256,
         to attach to a :class:`~.pyhanko.pdf_utils.writer.PdfFileWriter`.
         This handler will use the new PDF 2.0 encryption scheme.
+
+        Any remaining keyword arguments will be passed to the constructor.
 
         :param desired_owner_pass:
             Desired owner password.
@@ -1553,15 +1699,36 @@ class StandardSecurityHandler(SecurityHandler):
         encrypted_perms = \
             encryptor.update(extd_perms_bytes) + encryptor.finalize()
 
-        sh = StandardSecurityHandler(
+        sh = cls(
             version=SecurityHandlerVersion.AES256,
             revision=StandardSecuritySettingsRevision.AES256,
             legacy_keylen=32, perm_flags=perms, odata=o_entry,
             udata=u_entry, oeseed=oe_seed, ueseed=ue_seed,
-            encrypted_perms=encrypted_perms, encrypt_metadata=True
+            encrypted_perms=encrypted_perms, encrypt_metadata=True,
+            **kwargs
         )
         sh._shared_key = encryption_key
         return sh
+
+    @staticmethod
+    def _check_r6_values(udata, odata, oeseed, ueseed, encrypted_perms, rev=6):
+
+        if not (len(udata) == len(odata) == 48):
+            raise misc.PdfError(
+                "/U and /O entries must be 48 bytes long in a "
+                f"rev. {rev} security handler"
+            )  # pragma: nocover
+        if not oeseed or not ueseed or \
+                not (len(oeseed) == len(ueseed) == 32):
+            raise misc.PdfError(
+                "/UE and /OE must be present and be 32 bytes long in a "
+                f"rev. {rev} security handler"
+            )  # pragma: nocover
+        if not encrypted_perms or len(encrypted_perms) != 16:
+            raise misc.PdfError(
+                "/Perms must be present and be 16 bytes long in a "
+                f"rev. {rev} security handler"
+            )  # pragma: nocover
 
     def __init__(self, version: SecurityHandlerVersion,
                  revision: StandardSecuritySettingsRevision,
@@ -1585,25 +1752,12 @@ class StandardSecurityHandler(SecurityHandler):
         )
         self.revision = revision
         self.perms = _as_signed(perm_flags)
-        if revision == StandardSecuritySettingsRevision.AES256:
-            if not (len(udata) == len(odata) == 48):
-                raise misc.PdfError(
-                    "/U and /O entries must be 48 bytes long in a "
-                    "rev. 6 security handler"
-                )  # pragma: nocover
-            if not oeseed or not ueseed or \
-                    not (len(oeseed) == len(ueseed) == 32):
-                raise misc.PdfError(
-                    "/UE and /OE must be present and be 32 bytes long in a "
-                    "rev. 6 security handler"
-                )  # pragma: nocover
+        if revision >= StandardSecuritySettingsRevision.AES256:
+            StandardSecurityHandler._check_r6_values(
+                udata, odata, oeseed, ueseed, encrypted_perms
+            )
             self.oeseed = oeseed
             self.ueseed = ueseed
-            if not encrypted_perms or len(encrypted_perms) != 16:
-                raise misc.PdfError(
-                    "/Perms must be present and be 16 bytes long in a "
-                    "rev. 6 security handler"
-                )  # pragma: nocover
             self.encrypted_perms = encrypted_perms
         else:
             if not (len(udata) == len(odata) == 32):
@@ -1617,67 +1771,24 @@ class StandardSecurityHandler(SecurityHandler):
         self._shared_key = None
         self._auth_failed = False
 
-    @staticmethod
-    def read_standard_cf_dictionary(cfdict):
-        """
-        Interpret a crypt filter dictionary for the standard security handler.
-
-        :param cfdict:
-            A crypt filter dictionary.
-        :return:
-            An appropriate :class:`.CryptFilter` object, or ``None``
-            if the crypt filter uses the ``/None`` method.
-        :raise NotImplementedError:
-            Raised when the crypt filter's ``/CFM`` entry indicates an unknown
-            crypt filter method.
-        """
-        # TODO does a V4 handler default to /Identity unless the /Encrypt
-        #  dictionary specifies a custom filter?
-        try:
-            cfm = cfdict['/CFM']
-        except KeyError:
-            return None
-        if cfm == '/None':
-            return None
-        elif cfm == '/V2':
-            keylen_bits = cfdict.get('/Length', 40)
-            return StandardRC4CryptFilter(keylen=keylen_bits // 8)
-        elif cfm == '/AESV2':
-            return StandardAESCryptFilter(keylen=16)
-        elif cfm == '/AESV3':
-            return StandardAESCryptFilter(keylen=32)
-        else:
-            raise NotImplementedError("No such crypt filter method: " + cfm)
-
     @classmethod
-    def instantiate_from_pdf_object(cls,
-                                    encrypt_dict: generic.DictionaryObject):
-        v = SecurityHandlerVersion(encrypt_dict['/V'])
-        r = StandardSecuritySettingsRevision(encrypt_dict['/R'])
+    def gather_encryption_metadata(cls,
+                                   encrypt_dict: generic.DictionaryObject) \
+            -> dict:
+        """
+        Gather and preprocess the "easy" metadata values in an encryption
+        dictionary, and turn them into constructor kwargs.
+
+        This function processes ``/Length``, ``/P``, ``/Perms``, ``/O``, ``/U``,
+        ``/OE``, ``/UE`` and ``/EncryptMetadata``.
+        """
+
         keylen_bits = encrypt_dict.get('/Length', 40)
         if (keylen_bits % 8) != 0:
             raise misc.PdfError("Key length must be a multiple of 8")
         keylen = keylen_bits // 8
-        stmf = encrypt_dict.get('/StmF', IDENTITY)
-        strf = encrypt_dict.get('/StrF', IDENTITY)
-        eff = encrypt_dict.get('/EFF', stmf)
-
-        try:
-            crypt_filters = {
-                name: StandardSecurityHandler.read_standard_cf_dictionary(
-                    cfdict
-                )
-                for name, cfdict in encrypt_dict['/CF'].items()
-            }
-            cfc = CryptFilterConfiguration(
-                crypt_filters=crypt_filters, default_stream_filter=stmf,
-                default_string_filter=strf, default_file_filter=eff
-            )
-        except KeyError:
-            cfc = None
-        return StandardSecurityHandler(
-            version=v, revision=r, legacy_keylen=keylen,
-            crypt_filter_config=cfc,
+        return dict(
+            legacy_keylen=keylen,
             perm_flags=_as_signed(encrypt_dict.get('/P', ALL_PERMS)),
             odata=encrypt_dict['/O'].original_bytes[:48],
             udata=encrypt_dict['/U'].original_bytes[:48],
@@ -1695,22 +1806,33 @@ class StandardSecurityHandler(SecurityHandler):
             )
         )
 
+    @classmethod
+    def instantiate_from_pdf_object(cls,
+                                    encrypt_dict: generic.DictionaryObject):
+        v = SecurityHandlerVersion.from_number(encrypt_dict['/V'])
+        r = StandardSecuritySettingsRevision.from_number(encrypt_dict['/R'])
+        return StandardSecurityHandler(
+            version=v, revision=r,
+            crypt_filter_config=cls.process_crypt_filters(encrypt_dict),
+            **cls.gather_encryption_metadata(encrypt_dict)
+        )
+
     def as_pdf_object(self):
         result = generic.DictionaryObject()
         result['/Filter'] = generic.NameObject('/Standard')
         result['/O'] = generic.ByteStringObject(self.odata)
         result['/U'] = generic.ByteStringObject(self.udata)
         result['/P'] = generic.NumberObject(_as_signed(self.perms))
-        result['/V'] = generic.NumberObject(self.version.value)
-        result['/R'] = generic.NumberObject(self.revision.value)
         # this shouldn't be necessary for V5 handlers, but Adobe Reader
         # requires it anyway ...sigh...
         result['/Length'] = generic.NumberObject(self.keylen * 8)
+        result['/V'] = self.version.as_pdf_object()
+        result['/R'] = self.revision.as_pdf_object()
         if self.version > SecurityHandlerVersion.RC4_LONGER_KEYS:
             result['/EncryptMetadata'] \
                 = generic.BooleanObject(self.encrypt_metadata)
             result.update(self.crypt_filter_config.as_pdf_object())
-        if self.revision == StandardSecuritySettingsRevision.AES256:
+        if self.revision >= StandardSecuritySettingsRevision.AES256:
             result['/OE'] = generic.ByteStringObject(self.oeseed)
             result['/UE'] = generic.ByteStringObject(self.ueseed)
             result['/Perms'] = generic.ByteStringObject(self.encrypted_perms)
@@ -1767,7 +1889,7 @@ class StandardSecurityHandler(SecurityHandler):
         """
         res: AuthStatus
         rev = self.revision
-        if rev == StandardSecuritySettingsRevision.AES256:
+        if rev >= StandardSecuritySettingsRevision.AES256:
             res, key = self._authenticate_r6(credential)
         else:
             if id1 is None:
@@ -2193,6 +2315,44 @@ def read_seed_from_recipient_cms(recipient_cms: cms.ContentInfo,
     return seed, perms
 
 
+def _read_generic_pubkey_cf_info(cfdict: generic.DictionaryObject):
+    try:
+        recipients = cfdict['/Recipients']
+    except KeyError:
+        raise misc.PdfReadError(
+            "PubKey CF dictionary must have /Recipients key"
+        )
+    if isinstance(recipients, generic.ByteStringObject):
+        recipients = recipients,
+    recipient_objs = [
+        cms.ContentInfo.load(x.original_bytes) for x in recipients
+    ]
+    encrypt_metadata = cfdict.get('/EncryptMetadata', True)
+    return {'recipients': recipient_objs, 'encrypt_metadata': encrypt_metadata}
+
+
+def _build_legacy_pubkey_cf(cfdict, acts_as_default):
+    keylen_bits = cfdict.get('/Length', 40)
+    return PubKeyRC4CryptFilter(
+        keylen=keylen_bits // 8, acts_as_default=acts_as_default,
+        **_read_generic_pubkey_cf_info(cfdict)
+    )
+
+
+def _build_aes128_pubkey_cf(cfdict, acts_as_default):
+    return PubKeyAESCryptFilter(
+        keylen=16, acts_as_default=acts_as_default,
+        ** _read_generic_pubkey_cf_info(cfdict)
+    )
+
+
+def _build_aes256_pubkey_cf(cfdict, acts_as_default):
+    return PubKeyAESCryptFilter(
+        keylen=32, acts_as_default=acts_as_default,
+        ** _read_generic_pubkey_cf_info(cfdict)
+    )
+
+
 @SecurityHandler.register
 class PubKeySecurityHandler(SecurityHandler):
     """
@@ -2202,20 +2362,28 @@ class PubKeySecurityHandler(SecurityHandler):
     have to instantiate these yourself (see :meth:`build_from_certs`).
     """
 
-    @staticmethod
-    def build_from_certs(certs: List[x509.Certificate],
+    _known_crypt_filters: Dict[generic.NameObject, CryptFilterBuilder] = {
+        '/V2': _build_legacy_pubkey_cf,
+        '/AESV2': _build_aes128_pubkey_cf,
+        '/AESV3': _build_aes256_pubkey_cf,
+        '/Identity': lambda _, __: IdentityCryptFilter()
+    }
+
+    @classmethod
+    def build_from_certs(cls, certs: List[x509.Certificate],
                          keylen_bytes=16,
                          version=SecurityHandlerVersion.AES256,
                          use_aes=True, use_crypt_filters=True,
                          perms: int = ALL_PERMS,
-                         encrypt_metadata=True,
-                         ignore_key_usage=False) -> 'PubKeySecurityHandler':
+                         encrypt_metadata=True, ignore_key_usage=False,
+                         **kwargs) -> 'PubKeySecurityHandler':
         """
         Create a new public key security handler.
 
         This method takes many parameters, but only ``certs`` is mandatory.
         The default behaviour is to create a public key encryption handler
         where the underlying symmetric encryption is provided by AES-256.
+        Any remaining keyword arguments will be passed to the constructor.
 
         :param certs:
             The recipients' certificates.
@@ -2237,7 +2405,7 @@ class PubKeySecurityHandler(SecurityHandler):
             Whether to encrypt document metadata.
 
             .. warning::
-                See :class:`.SecurityHandlers` for some background on the
+                See :class:`.SecurityHandler` for some background on the
                 way pyHanko interprets this value.
         :param ignore_key_usage:
             If ``False``, the *keyEncipherment* key usage extension is required.
@@ -2262,10 +2430,11 @@ class PubKeySecurityHandler(SecurityHandler):
                     keylen_bytes, recipients=None,
                     encrypt_metadata=encrypt_metadata
                 )
-        sh = PubKeySecurityHandler(
+        # noinspection PyArgumentList
+        sh = cls(
             version, subfilter, keylen_bytes,
             encrypt_metadata=encrypt_metadata, crypt_filter_config=cfc,
-            recipient_objs=None
+            recipient_objs=None, **kwargs
         )
         sh.add_recipients(certs, perms=perms, ignore_key_usage=ignore_key_usage)
         return sh
@@ -2321,11 +2490,62 @@ class PubKeySecurityHandler(SecurityHandler):
         return {x.value for x in PubKeyAdbeSubFilter}
 
     @classmethod
-    def instantiate_from_pdf_object(cls,
-                                    encrypt_dict: generic.DictionaryObject):
-        v = SecurityHandlerVersion(encrypt_dict['/V'])
+    def read_cf_dictionary(cls, cfdict: generic.DictionaryObject,
+                           acts_as_default: bool) -> CryptFilter:
+
+        cf = build_crypt_filter(
+            cls._known_crypt_filters, cfdict, acts_as_default
+        )
+        if cf is None:
+            raise misc.PdfReadError(
+                "An absent CFM or CFM of /None doesn't make sense in a "
+                "PubSec CF dictionary"
+            )
+        return cf
+
+    @classmethod
+    def process_crypt_filters(cls, encrypt_dict: generic.DictionaryObject) \
+            -> Optional['CryptFilterConfiguration']:
+        cfc = super().process_crypt_filters(encrypt_dict)
+        subfilter = cls._determine_subfilter(encrypt_dict)
+
+        if cfc is not None and subfilter != PubKeyAdbeSubFilter.S5:
+            raise misc.PdfReadError(
+                "Crypt filters require /adbe.pkcs7.s5 as the declared "
+                "handler."
+            )
+        elif cfc is None and subfilter == PubKeyAdbeSubFilter.S5:
+            raise misc.PdfReadError(
+                "/adbe.pkcs7.s5 handler requires crypt filters."
+            )
+        return cfc
+
+    @classmethod
+    def gather_pub_key_metadata(cls, encrypt_dict: generic.DictionaryObject):
+        keylen_bits = encrypt_dict.get('/Length', 128)
+        if (keylen_bits % 8) != 0:
+            raise misc.PdfError("Key length must be a multiple of 8")
+        keylen = keylen_bits // 8
+
+        recipients = misc.get_and_apply(
+            encrypt_dict, '/Recipients',
+            lambda lst: [cms.ContentInfo.load(x.original_bytes) for x in lst]
+        )
+
+        # TODO get encrypt_metadata handling in line with ISO 32k
+        #  (needs to happen at the crypt filter level instead)
+        encrypt_metadata = encrypt_dict.get_and_apply(
+            '/EncryptMetadata', bool, default=True
+        )
+        return dict(
+            legacy_keylen=keylen, recipient_objs=recipients,
+            encrypt_metadata=encrypt_metadata
+        )
+
+    @classmethod
+    def _determine_subfilter(cls, encrypt_dict: generic.DictionaryObject):
         try:
-            subfilter = misc.get_and_apply(
+            return misc.get_and_apply(
                 encrypt_dict, '/SubFilter', PubKeyAdbeSubFilter, default=(
                     PubKeyAdbeSubFilter.S5 if '/CF' in encrypt_dict
                     else PubKeyAdbeSubFilter.S4
@@ -2337,55 +2557,23 @@ class PubKeySecurityHandler(SecurityHandler):
                 + encrypt_dict['/SubFilter']
             )
 
-        keylen_bits = encrypt_dict.get('/Length', 128)
-        if (keylen_bits % 8) != 0:
-            raise misc.PdfError("Key length must be a multiple of 8")
-        keylen = keylen_bits // 8
-        try:
-            stmf = encrypt_dict.get('/StmF', IDENTITY)
-            strf = encrypt_dict.get('/StrF', IDENTITY)
-            eff = encrypt_dict.get('/EFF', stmf)
-            default_filters = {stmf, strf}
-            crypt_filters = {
-                name: PubKeySecurityHandler.read_pubkey_cf_dictionary(
-                    cfdict, name in default_filters
-                )
-                for name, cfdict in encrypt_dict['/CF'].items()
-            }
-            if subfilter != PubKeyAdbeSubFilter.S5:
-                raise misc.PdfReadError(
-                    "Crypt filters require /adbe.pkcs7.s5 as the declared "
-                    "handler."
-                )
+    @classmethod
+    def instantiate_from_pdf_object(cls,
+                                    encrypt_dict: generic.DictionaryObject):
+        v = SecurityHandlerVersion.from_number(encrypt_dict['/V'])
 
-            cfc = CryptFilterConfiguration(
-                crypt_filters=crypt_filters, default_stream_filter=stmf,
-                default_string_filter=strf, default_file_filter=eff
-            )
-        except KeyError:
-            if subfilter == PubKeyAdbeSubFilter.S5:
-                raise misc.PdfReadError(
-                    "/adbe.pkcs7.s5 handler requires crypt filters."
-                )
-            cfc = None
-        recipients = misc.get_and_apply(
-            encrypt_dict, '/Recipients',
-            lambda lst: [cms.ContentInfo.load(x.original_bytes) for x in lst]
-        )
         return PubKeySecurityHandler(
-            version=v, pubkey_handler_subfilter=subfilter,
-            legacy_keylen=keylen, recipient_objs=recipients,
-            crypt_filter_config=cfc,
-            encrypt_metadata=encrypt_dict.get_and_apply(
-                '/EncryptMetadata', bool, default=True
-            )
+            version=v,
+            pubkey_handler_subfilter=cls._determine_subfilter(encrypt_dict),
+            crypt_filter_config=cls.process_crypt_filters(encrypt_dict),
+            **cls.gather_pub_key_metadata(encrypt_dict)
         )
 
     def as_pdf_object(self):
         result = generic.DictionaryObject()
         result['/Filter'] = generic.NameObject(self.get_name())
         result['/SubFilter'] = self.subfilter.value
-        result['/V'] = generic.NumberObject(self.version.value)
+        result['/V'] = self.version.as_pdf_object()
         result['/Length'] = generic.NumberObject(self.keylen * 8)
         if self.version > SecurityHandlerVersion.RC4_LONGER_KEYS:
             result['/EncryptMetadata'] \
@@ -2451,58 +2639,6 @@ class PubKeySecurityHandler(SecurityHandler):
             # course of action
             perms &= result.permission_flags
         return AuthResult(AuthStatus.USER, _as_signed(perms))
-
-    @staticmethod
-    def read_pubkey_cf_dictionary(cfdict, acts_as_default):
-        """
-        Read a crypt filter dictionary for a public key security handler.
-
-        :param cfdict:
-            A crypt filter dictionary.
-        :param acts_as_default:
-            Indicates whether this filter is intended to be used in
-            ``/StrF`` or ``/StmF``.
-        :return:
-            A :class:`.CryptFilter` object.
-        """
-        try:
-            cfm = cfdict['/CFM']
-            recipients = cfdict['/Recipients']
-        except KeyError:
-            raise misc.PdfReadError(
-                "PubKey CF dictionary must have /Recipients and /CFM keys"
-            )
-        if isinstance(recipients, generic.ByteStringObject):
-            recipients = recipients,
-        recipient_objs = [
-            cms.ContentInfo.load(x.original_bytes) for x in recipients
-        ]
-        encrypt_metadata = cfdict.get('/EncryptMetadata', True)
-        if cfm == '/None':
-            raise misc.PdfReadError(
-                "/None doesn't make sense in a PubKey CF dictionary"
-            )
-        elif cfm == '/V2':
-            keylen_bits = cfdict.get('/Length', 40)
-            return PubKeyRC4CryptFilter(
-                keylen=keylen_bits // 8,
-                encrypt_metadata=encrypt_metadata, recipients=recipient_objs,
-                acts_as_default=acts_as_default
-            )
-        elif cfm == '/AESV2':
-            return PubKeyAESCryptFilter(
-                keylen=16,
-                encrypt_metadata=encrypt_metadata, recipients=recipient_objs,
-                acts_as_default=acts_as_default
-            )
-        elif cfm == '/AESV3':
-            return PubKeyAESCryptFilter(
-                keylen=32,
-                encrypt_metadata=encrypt_metadata, recipients=recipient_objs,
-                acts_as_default=acts_as_default
-            )
-        else:
-            raise NotImplementedError("No such crypt filter method: " + cfm)
 
     def get_file_encryption_key(self) -> bytes:
         # just grab the key from the default stream filter

@@ -1,5 +1,4 @@
 import binascii
-import hashlib
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -17,9 +16,10 @@ from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import pkcs12
 
-from certvalidator.errors import PathValidationError, PathBuildingError
+from pyhanko_certvalidator.errors import PathValidationError, PathBuildingError
 
-from certvalidator import ValidationContext, CertificateValidator
+from pyhanko_certvalidator import ValidationContext, CertificateValidator
+from pyhanko.sign.ades.api import CAdESSignedAttrSpec
 
 from pyhanko.pdf_utils import generic, misc
 from pyhanko.pdf_utils.generic import pdf_name, pdf_date, pdf_string
@@ -31,7 +31,7 @@ from pyhanko.sign import general
 from pyhanko.sign.fields import (
     enumerate_sig_fields, _prepare_sig_field,
     SigSeedValueSpec, SigSeedValFlags, SigSeedSubFilter, MDPPerm, FieldMDPSpec,
-    SigFieldSpec, SeedLockDocument
+    SigFieldSpec, SeedLockDocument, _ensure_sig_flags
 )
 from pyhanko.sign.timestamps import TimeStamper
 from pyhanko.sign.general import (
@@ -40,7 +40,7 @@ from pyhanko.sign.general import (
     load_certs_from_pemder, load_cert_from_pemder,
     _process_pss_params, load_private_key_from_pemder,
     _translate_pyca_cryptography_key_to_asn1,
-    _translate_pyca_cryptography_cert_to_asn1,
+    _translate_pyca_cryptography_cert_to_asn1, get_pyca_cryptography_hash,
 )
 from pyhanko.stamp import (
     TextStampStyle, TextStamp, STAMP_ART_CONTENT,
@@ -128,28 +128,6 @@ class DERPlaceholder(generic.PdfObject):
 DEFAULT_SIG_SUBFILTER = SigSeedSubFilter.ADOBE_PKCS7_DETACHED
 
 
-def _prepare_signable_output(output):
-    # Render the PDF to a byte buffer with placeholder values
-    # for the signature data, or straight to the provided output stream
-    # if possible
-    if output is None:
-        output = BytesIO()
-    else:
-        # Rationale for the explicit writability check:
-        #  If the output buffer is not readable or not seekable, it's
-        #  about to be replaced with a BytesIO instance, and in that
-        #  case, the write error would only happen *after* the signing
-        #  operations are done. We want to avoid that scenario.
-        if not output.writable():
-            raise IOError(
-                "Output buffer is not writable"
-            )  # pragma: nocover
-        if not output.seekable() or not output.readable():
-            output = BytesIO()
-
-    return output
-
-
 class PdfByteRangeDigest(generic.DictionaryObject):
 
     def __init__(self, data_key=pdf_name('/Contents'), *, bytes_reserved=None):
@@ -182,7 +160,7 @@ class PdfByteRangeDigest(generic.DictionaryObject):
             output = writer.prev.stream
             writer.write_in_place()
         else:
-            output = _prepare_signable_output(output)
+            output = misc.prepare_rw_output_stream(output)
 
             writer.write(output)
 
@@ -193,7 +171,8 @@ class PdfByteRangeDigest(generic.DictionaryObject):
         self.byte_range.fill_offsets(output, sig_start, sig_end, eof)
 
         # compute the digests
-        md = getattr(hashlib, md_algorithm)()
+        md_spec = get_pyca_cryptography_hash(md_algorithm)
+        md = hashes.Hash(md_spec)
 
         # attempt to get a memoryview for automatic buffering
         output_buffer = None
@@ -207,7 +186,11 @@ class PdfByteRangeDigest(generic.DictionaryObject):
 
         if output_buffer is not None:
             # these are memoryviews, so slices should not copy stuff around
+            #   (also, the interface files for pyca/cryptography don't specify
+            #    that memoryviews are allowed, but they are)
+            # noinspection PyTypeChecker
             md.update(output_buffer[:sig_start])
+            # noinspection PyTypeChecker
             md.update(output_buffer[sig_end:eof])
             output_buffer.release()
         else:
@@ -217,7 +200,7 @@ class PdfByteRangeDigest(generic.DictionaryObject):
             output.seek(sig_end)
             misc.chunked_digest(temp_buffer, output, md, max_read=eof-sig_end)
 
-        digest_value = md.digest()
+        digest_value = md.finalize()
         cms_data = yield digest_value
 
         if isinstance(cms_data, bytes):
@@ -420,6 +403,8 @@ class Signer:
         elif algo == 'rsa':
             if self.prefer_pss:
                 mech = 'rsassa_pss'
+                if digest_algorithm is None:
+                    raise ValueError("Digest algorithm required")
                 params = optimal_pss_params(
                     self.signing_cert, digest_algorithm
                 )
@@ -502,10 +487,14 @@ class Signer:
 
     def signed_attrs(self, data_digest: bytes, digest_algorithm: str,
                      timestamp: datetime = None,
-                     revocation_info=None, use_pades=False):
+                     revocation_info=None, use_pades=False,
+                     cades_meta: CAdESSignedAttrSpec=None,
+                     timestamper=None, dry_run=False):
         """
         .. versionchanged:: 0.4.0
             Added positional ``digest_algorithm`` parameter _(breaking change)_.
+        .. versionchanged:: 0.5.0
+            Added ``dry_run``, ``timestamper`` and ``cades_meta`` parameters.
 
         Format the signed attributes for a CMS signature.
 
@@ -523,6 +512,20 @@ class Signer:
             (ignored when ``use_pades`` is ``True``).
         :param use_pades:
             Respect PAdES requirements.
+        :param dry_run:
+            .. versionadded:: 0.5.0
+
+            Flag indicating "dry run" mode. If ``True``, only the approximate
+            size of the output matters, so cryptographic
+            operations can be replaced by placeholders.
+        :param timestamper:
+            .. versionadded:: 0.5.0
+
+            Timestamper to use when creating timestamp tokens.
+        :param cades_meta:
+            .. versionadded:: 0.5.0
+
+            Specification for CAdES-specific attributes.
         :return:
             An :class:`.asn1crypto.cms.CMSAttributes` object.
         """
@@ -569,6 +572,14 @@ class Signer:
                 )
             )
 
+        # apply CAdES-specific attributes regardless of use_pades
+        if cades_meta is not None:
+            cades_attrs = cades_meta.extra_signed_attributes(
+                data_digest, digest_algorithm, timestamper=timestamper,
+                dry_run=dry_run
+            )
+            attrs.extend(cades_attrs)
+
         return cms.CMSAttributes(attrs)
 
     def unsigned_attrs(self, digest_algorithm, signature: bytes,
@@ -601,13 +612,15 @@ class Signer:
 
         if timestamper is not None:
             # the timestamp server needs to cross-sign our signature
-            md = getattr(hashlib, digest_algorithm)()
+
+            md_spec = get_pyca_cryptography_hash(digest_algorithm)
+            md = hashes.Hash(md_spec)
             md.update(signature)
             if dry_run:
                 ts_token = timestamper.dummy_response(digest_algorithm)
             else:
                 ts_token = timestamper.timestamp(
-                    md.digest(), digest_algorithm
+                    md.finalize(), digest_algorithm
                 )
             return cms.CMSAttributes(
                 [simple_cms_attribute('signature_time_stamp_token', ts_token)]
@@ -652,8 +665,9 @@ class Signer:
 
     def sign(self, data_digest: bytes, digest_algorithm: str,
              timestamp: datetime = None, dry_run=False,
-             revocation_info=None, use_pades=False,
-             timestamper=None) -> cms.ContentInfo:
+             revocation_info=None, use_pades=False, timestamper=None,
+             cades_signed_attr_meta: CAdESSignedAttrSpec = None) \
+            -> cms.ContentInfo:
 
         """
         Produce a detached CMS signature from a raw data digest.
@@ -690,6 +704,10 @@ class Signer:
                 this might still hit the timestamping server (in order to
                 produce a realistic size estimate), but the dummy response will
                 be cached.
+        :param cades_signed_attr_meta:
+            .. versionadded:: 0.5.0
+
+            Specification for CAdES-specific attributes.
         :return:
             An :class:`~.asn1crypto.cms.ContentInfo` object.
         """
@@ -699,7 +717,9 @@ class Signer:
         # signed attributes of our message
         signed_attrs = self.signed_attrs(
             data_digest, digest_algorithm, timestamp,
-            revocation_info=revocation_info, use_pades=use_pades
+            revocation_info=revocation_info, use_pades=use_pades,
+            timestamper=timestamper, cades_meta=cades_signed_attr_meta,
+            dry_run=dry_run
         )
 
         digest_algorithm_obj = algos.DigestAlgorithm(
@@ -761,6 +781,11 @@ Default message digest algorithm used when computing digests for use in
 signatures.
 """
 
+DEFAULT_SIGNER_KEY_USAGE = {"non_repudiation"}
+"""
+Default key usage bits required for the signer's certificate.
+"""
+
 
 @dataclass(frozen=True)
 class PdfSignatureMetadata:
@@ -777,7 +802,7 @@ class PdfSignatureMetadata:
     md_algorithm: str = None
     """
     The name of the digest algorithm to use.
-    It should be supported by :mod:`hashlib`.
+    It should be supported by `pyca/cryptography`.
 
     If ``None``, this will ordinarily default to the value of
     :const:`.DEFAULT_MD`, unless a seed value dictionary and/or a prior
@@ -876,7 +901,8 @@ class PdfSignatureMetadata:
     docmdp_permissions: MDPPerm = MDPPerm.FILL_FORMS
     """
     Indicates the document modification policy that will be in force after    
-    this signature is created.
+    this signature is created. Only relevant for certification signatures
+    or signatures that apply locking.
     
     .. warning::
         For non-certification signatures, this is only explicitly allowed since 
@@ -885,7 +911,7 @@ class PdfSignatureMetadata:
     """
 
     signer_key_usage: Set[str] = field(
-        default_factory=lambda: {"non_repudiation"}
+        default_factory=lambda: DEFAULT_SIGNER_KEY_USAGE
     )
     """
     Key usage extensions required for the signer's certificate.
@@ -894,6 +920,13 @@ class PdfSignatureMetadata:
     See :class:`x509.KeyUsage` for a complete list.
     
     Only relevant if a validation context is also provided.
+    """
+
+    cades_signed_attr_spec: Optional[CAdESSignedAttrSpec] = None
+    """
+    .. versionadded:: 0.5.0
+
+    Specification for CAdES-specific attributes.
     """
 
 
@@ -930,7 +963,7 @@ class SimpleSigner(Signer):
 
         if mechanism == 'rsassa_pkcs1v15':
             padding = PKCS1v15()
-            hash_algo = getattr(hashes, digest_algorithm.upper())()
+            hash_algo = get_pyca_cryptography_hash(digest_algorithm)
             assert isinstance(priv_key, RSAPrivateKey)
             return priv_key.sign(data, padding, hash_algo)
         elif mechanism == 'rsassa_pss':
@@ -941,7 +974,7 @@ class SimpleSigner(Signer):
             assert isinstance(priv_key, RSAPrivateKey)
             return priv_key.sign(data, padding, hash_algo)
         elif mechanism == 'ecdsa':
-            hash_algo = getattr(hashes, digest_algorithm.upper())()
+            hash_algo = get_pyca_cryptography_hash(digest_algorithm)
             assert isinstance(priv_key, EllipticCurvePrivateKey)
             return priv_key.sign(data, signature_algorithm=ECDSA(hash_algo))
         else:  # pragma: nocover
@@ -1209,8 +1242,10 @@ def _get_or_create_sigfield(field_name, pdf_out: BasePdfFileWriter,
         field_created, sig_field_ref = _prepare_sig_field(
             field_name, root, update_writer=pdf_out,
             existing_fields_only=existing_fields_only,
-            lock_sig_flags=True, **sig_field_kwargs
+            **sig_field_kwargs
         )
+
+    _ensure_sig_flags(writer=pdf_out, lock_sig_flags=True)
 
     return field_created, sig_field_ref
 
@@ -1251,8 +1286,15 @@ class SigMDPSetup:
     def _apply(self, sig_obj_ref, writer):
 
         certify = self.certify
+        docmdp_perms = self.docmdp_perms
+
+        lock = self.field_lock
+        md_algorithm = self.md_algorithm
+
+        reference_array = generic.ArrayObject()
 
         if certify:
+            assert docmdp_perms is not None
             # To make a certification signature, we need to leave a record
             #  in the document catalog.
             root = writer.root
@@ -1262,23 +1304,21 @@ class SigMDPSetup:
                 root['/Perms'] = perms = generic.DictionaryObject()
             perms[pdf_name('/DocMDP')] = sig_obj_ref
             writer.update_container(perms)
-
-        lock = self.field_lock
-        md_algorithm = self.md_algorithm
-
-        reference_array = generic.ArrayObject()
-        if lock is not None:
-            reference_array.append(
-                fieldmdp_reference_dictionary(
-                    lock, md_algorithm, data_ref=writer.root_ref
-                )
-            )
-
-        docmdp_perms = self.docmdp_perms
-        if docmdp_perms is not None:
             reference_array.append(
                 docmdp_reference_dictionary(md_algorithm, docmdp_perms)
             )
+
+        if lock is not None:
+            fieldmdp_ref = fieldmdp_reference_dictionary(
+                lock, md_algorithm, data_ref=writer.root_ref
+            )
+            reference_array.append(fieldmdp_ref)
+
+            if docmdp_perms is not None:
+                # NOTE: this is NOT spec-compatible, but emulates Acrobat
+                # behaviour
+                fieldmdp_ref['/TransformParams']['/P'] = \
+                    generic.NumberObject(docmdp_perms.value)
 
         if reference_array:
             sig_obj_ref.get_object()['/Reference'] = reference_array
@@ -1398,7 +1438,7 @@ class SigIOSetup:
     md_algorithm: str
     """
     Message digest algorithm to use to compute the document hash.
-    It should be supported by :mod:`hashlib`.
+    It should be supported by `pyca/cryptography`.
     
     .. warning::
         This is also the message digest algorithm that should appear in the
@@ -1610,8 +1650,8 @@ class PdfTimeStamper:
     #  validation regardless.
 
     def timestamp_pdf(self, pdf_out: IncrementalPdfFileWriter,
-                      md_algorithm, validation_context, bytes_reserved=None,
-                      validation_paths=None,
+                      md_algorithm, validation_context=None,
+                      bytes_reserved=None, validation_paths=None,
                       timestamper: Optional[TimeStamper] = None, *,
                       in_place=False, output=None, chunk_size=4096):
         """Timestamp the contents of ``pdf_out``.
@@ -1622,7 +1662,7 @@ class PdfTimeStamper:
         :param md_algorithm:
             The hash algorithm to use when computing message digests.
         :param validation_context:
-            The :class:`.certvalidator.ValidationContext`
+            The :class:`.pyhanko_certvalidator.ValidationContext`
             against which the TSA response should be validated.
             This validation context will also be used to update the DSS.
         :param bytes_reserved:
@@ -1658,11 +1698,6 @@ class PdfTimeStamper:
             # see sign_pdf comments
             bytes_reserved = test_len + 2 * (test_len // 4)
 
-        if validation_paths is None:
-            validation_paths = list(
-                timestamper.validation_paths(validation_context)
-            )
-
         timestamp_obj = DocumentTimestamp(bytes_reserved=bytes_reserved)
 
         cms_writer = PdfCMSEmbedder().write_cms(
@@ -1685,11 +1720,17 @@ class PdfTimeStamper:
         res_output, sig_contents = cms_writer.send(timestamp_cms)
 
         # update the DSS
-        from pyhanko.sign import validation
-        validation.DocumentSecurityStore.add_dss(
-            output_stream=res_output, sig_contents=sig_contents,
-            paths=validation_paths, validation_context=validation_context
-        )
+        if validation_context is not None:
+            from pyhanko.sign import validation
+            if validation_paths is None:
+                validation_paths = list(
+                    timestamper.validation_paths(validation_context)
+                )
+
+            validation.DocumentSecurityStore.add_dss(
+                output_stream=res_output, sig_contents=sig_contents,
+                paths=validation_paths, validation_context=validation_context
+            )
 
         output = _finalise_output(output, res_output)
 
@@ -1706,7 +1747,7 @@ class PdfTimeStamper:
         :param reader:
             A :class:`PdfReader` encapsulating the input file.
         :param validation_context:
-            :class:`.certvalidator.ValidationContext` object to validate
+            :class:`.pyhanko_certvalidator.ValidationContext` object to validate
             the last timestamp.
         :param output:
             Write the output to the specified output stream.
@@ -1745,9 +1786,9 @@ class PdfTimeStamper:
             last_timestamp = None
 
         # Validate the previous timestamp if present
+        tst_status = None
         if last_timestamp is None:
             md_algorithm = default_md_algorithm
-            tst_status = None
         else:
             last_timestamp.compute_digest()
             last_timestamp.compute_tst_digest()
@@ -1766,7 +1807,7 @@ class PdfTimeStamper:
         if in_place:
             output = reader.stream
         else:
-            output = _prepare_signable_output(output)
+            output = misc.prepare_rw_output_stream(output)
             reader.stream.seek(0)
             misc.chunked_write(
                 bytearray(chunk_size), reader.stream, output
@@ -1834,9 +1875,17 @@ class PdfSigner(PdfTimeStamper):
         self.signer = signer
         stamp_style = stamp_style or DEFAULT_SIGNING_STAMP_STYLE
         self.stamp_style: TextStampStyle = stamp_style
+        try:
+            self.signer_hash_algo = self.signer.get_signature_mechanism(None).hash_algo
+        except ValueError:
+            self.signer_hash_algo = None
 
         self.new_field_spec = new_field_spec
         super().__init__(timestamper)
+
+    @property
+    def default_md_for_signer(self) -> Optional[str]:
+        return self.signature_meta.md_algorithm or self.signer_hash_algo
 
     def generate_timestamp_field_name(self) -> str:
         """
@@ -1853,8 +1902,13 @@ class PdfSigner(PdfTimeStamper):
 
     def _apply_locking_rules(self, sig_field, md_algorithm,
                              sv_spec: SigSeedValueSpec = None) -> SigMDPSetup:
+        # TODO allow equivalent functionality to the /Lock dictionary
+        #  to be specified in PdfSignatureMetadata
+
         # this helper method handles /Lock dictionary and certification
         #  semantics.
+        # The fallback rules are messy and ad-hoc; behaviour is mostly
+        # documented by tests.
 
         # read recommendations and/or requirements from the SV dictionary
         if sv_spec is not None and not self._ignore_sv:
@@ -1871,7 +1925,7 @@ class PdfSigner(PdfTimeStamper):
             sv_lock_values = None
             sv_lock_value_req = False
 
-        lock = None
+        lock = lock_dict = None
         # init the DocMDP value with what the /LockDocument setting in the SV
         # dict recommends. If the constraint is mandatory, it might conflict
         # with the /Lock dictionary, but we'll deal with that later.
@@ -1916,6 +1970,18 @@ class PdfSigner(PdfTimeStamper):
                     f"but the signature field settings do "
                     f"not allow that. Setting '{docmdp_perms}' instead."
                 )
+
+        # if not certifying and docmdp_perms is not None, ensure the
+        # appropriate permission in the Lock dictionary is set
+        if not meta_certify and docmdp_perms is not None:
+            if lock_dict is None:
+                # set a field lock that doesn't do anything
+                sig_field['/Lock'] = lock_dict = generic.DictionaryObject({
+                    pdf_name('/Action'): pdf_name('/Include'),
+                    pdf_name('/Fields'): generic.ArrayObject()
+                })
+            lock_dict['/P'] = generic.NumberObject(docmdp_perms.value)
+
         return SigMDPSetup(
             certify=meta_certify, field_lock=lock, docmdp_perms=docmdp_perms,
             md_algorithm=md_algorithm
@@ -2028,7 +2094,7 @@ class PdfSigner(PdfTimeStamper):
                 )
         if (flags & SigSeedValFlags.DIGEST_METHOD) \
                 and sv_spec.digest_methods is not None:
-            selected_md = self.signature_meta.md_algorithm
+            selected_md = self.default_md_for_signer
             if selected_md is not None:
                 selected_md = selected_md.lower()
                 if selected_md not in sv_spec.digest_methods:
@@ -2104,15 +2170,24 @@ class PdfSigner(PdfTimeStamper):
         signature_meta: PdfSignatureMetadata = self.signature_meta
         signer: Signer = self.signer
         validation_context = signature_meta.validation_context
-        if signature_meta.embed_validation_info and validation_context is None:
-            raise SigningError(
-                'A validation context must be provided if '
-                'validation/revocation info is to be embedded into the '
-                'signature.'
-            )
+        if signature_meta.embed_validation_info:
+            if validation_context is None:
+                raise SigningError(
+                    'A validation context must be provided if '
+                    'validation/revocation info is to be embedded into the '
+                    'signature.'
+                )
+            elif not validation_context._allow_fetching:
+                logger.warning(
+                    "Validation/revocation info will be embedded, but "
+                    "fetching is not allowed. This may give rise to unexpected "
+                    "results."
+                )
         validation_paths = []
         signer_cert_validation_path = None
+        weak_hash_algos = ()
         if validation_context is not None:
+            weak_hash_algos = validation_context.weak_hash_algos
             # validate cert
             # (this also keeps track of any validation data automagically)
             validator = CertificateValidator(
@@ -2197,14 +2272,20 @@ class PdfSigner(PdfTimeStamper):
         else:
             sv_md_algorithm = None
 
-        if self.signature_meta.md_algorithm is not None:
-            md_algorithm = self.signature_meta.md_algorithm
+        if self.default_md_for_signer is not None:
+            md_algorithm = self.default_md_for_signer
         elif sv_md_algorithm is not None:
             md_algorithm = sv_md_algorithm
         elif author_sig_md_algorithm is not None:
             md_algorithm = author_sig_md_algorithm
         else:
             md_algorithm = DEFAULT_MD
+
+        if md_algorithm in weak_hash_algos:
+            raise SigningError(
+                f"The hash algorithm {md_algorithm} is considered weak in the "
+                f"specified validation context. Please choose another."
+            )
 
         # same for the subfilter: try signature_meta and SV dict, fall back
         #  to /adbe.pkcs7.detached by default
@@ -2233,6 +2314,7 @@ class PdfSigner(PdfTimeStamper):
 
         # do we need adobe-style revocation info?
         if signature_meta.embed_validation_info and not use_pades:
+            assert validation_context is not None  # checked earlier
             revinfo = Signer.format_revinfo(
                 ocsp_responses=validation_context.ocsps,
                 crls=validation_context.crls
@@ -2242,12 +2324,14 @@ class PdfSigner(PdfTimeStamper):
             revinfo = None
 
         if bytes_reserved is None:
-            test_md = getattr(hashlib, md_algorithm)().digest()
+            md_spec = get_pyca_cryptography_hash(md_algorithm)
+            test_md = hashes.Hash(md_spec).finalize()
             test_signature_cms = signer.sign(
                 test_md, md_algorithm,
                 timestamp=timestamp, use_pades=use_pades,
                 dry_run=True, revocation_info=revinfo,
-                timestamper=timestamper
+                timestamper=timestamper,
+                cades_signed_attr_meta=signature_meta.cades_signed_attr_spec
             )
             test_len = len(test_signature_cms.dump()) * 2
             # External actors such as timestamping servers can't be relied on to
@@ -2289,7 +2373,8 @@ class PdfSigner(PdfTimeStamper):
         signature_cms = signer.sign(
             true_digest, md_algorithm,
             timestamp=timestamp, use_pades=use_pades,
-            revocation_info=revinfo, timestamper=timestamper
+            revocation_info=revinfo, timestamper=timestamper,
+            cades_signed_attr_meta=signature_meta.cades_signed_attr_spec
         )
         # ... and feed it to the CMS writer
         res_output, sig_contents = cms_writer.send(signature_cms)

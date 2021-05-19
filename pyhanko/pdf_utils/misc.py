@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 __all__ = [
-    'PdfError', 'PdfReadError', 'PdfWriteError', 'PdfStreamError'
+    'PdfError', 'PdfReadError', 'PdfWriteError', 'PdfStreamError',
+    'get_and_apply'
 ]
+
+from io import BytesIO
 
 from typing import Callable, TypeVar, Generator, Iterable
 
@@ -170,22 +173,78 @@ class OrderedEnum(Enum):
     def __ge__(self, other):
         if self.__class__ is other.__class__:
             return self.value >= other.value
-        return NotImplemented
+        raise NotImplementedError
 
     def __gt__(self, other):
         if self.__class__ is other.__class__:
             return self.value > other.value
-        return NotImplemented
+        raise NotImplementedError
 
     def __le__(self, other):
         if self.__class__ is other.__class__:
             return self.value <= other.value
-        return NotImplemented
+        raise NotImplementedError
 
     def __lt__(self, other):
         if self.__class__ is other.__class__:
             return self.value < other.value
-        return NotImplemented
+        raise NotImplementedError
+
+
+class VersionEnum(Enum):
+    """
+    Ordered enum with support for ``None``, for future-proofing version-based
+    enums. In such enums, the value ``None`` can be used as a stand-in for
+    "any future version".
+    """
+
+    def __ge__(self, other):
+        if self.__class__ is other.__class__:
+            val = self.value
+            other_val = other.value
+            if val is None:
+                return True
+            elif other_val is None:
+                return False
+            else:
+                return val >= other_val
+        raise NotImplementedError
+
+    def __gt__(self, other):
+        if self.__class__ is other.__class__:
+            val = self.value
+            other_val = other.value
+            if val is None:
+                return other_val is not None
+            elif other_val is None:
+                return False
+            else:
+                return val > other_val
+        raise NotImplementedError
+
+    def __le__(self, other):
+        if self.__class__ is other.__class__:
+            val = self.value
+            other_val = other.value
+            if other_val is None:
+                return True
+            elif val is None:
+                return False
+            else:
+                return val <= other_val
+        raise NotImplementedError
+
+    def __lt__(self, other):
+        if self.__class__ is other.__class__:
+            val = self.value
+            other_val = other.value
+            if other_val is None:
+                return val is not None
+            elif val is None:
+                return False
+            else:
+                return val < other_val
+        raise NotImplementedError
 
 
 class LazyJoin:
@@ -290,3 +349,41 @@ class ConsList:
 
     def __repr__(self):  # pragma: nocover
         return f"ConsList({list(reversed(list(self)))})"
+
+
+def prepare_rw_output_stream(output):
+    """
+    Prepare an output stream that supports both reading and writing.
+    Intended to be used for writing & updating signed files:
+    when producing a signature, we render the PDF to a byte buffer with
+    placeholder values for the signature data, or straight to the provided
+    output stream if possible.
+
+    More precisely: this function will return the original output stream
+    if it is writable, readable and seekable.
+    If the ``output`` parameter is ``None``, not readable or not seekable,
+    this function will return a :class:`.BytesIO` instance instead.
+    If the ``output`` parameter is not ``None`` and not writable,
+    :class:`.IOError` will be raised.
+
+    :param output:
+        A writable file-like object, or ``None``.
+    :return:
+        A file-like object that supports reading, writing and seeking.
+    """
+    if output is None:
+        output = BytesIO()
+    else:
+        # Rationale for the explicit writability check:
+        #  If the output buffer is not readable or not seekable, it's
+        #  about to be replaced with a BytesIO instance, and in that
+        #  case, the write error would only happen *after* the signing
+        #  operations are done. We want to avoid that scenario.
+        if not output.writable():
+            raise IOError(
+                "Output buffer is not writable"
+            )  # pragma: nocover
+        if not output.seekable() or not output.readable():
+            output = BytesIO()
+
+    return output

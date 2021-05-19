@@ -1,7 +1,7 @@
 from io import BytesIO
 
 import pytest
-from certvalidator import CertificateValidator
+from pyhanko_certvalidator import CertificateValidator
 from freezegun.api import freeze_time
 
 from pyhanko.pdf_utils import generic
@@ -222,7 +222,7 @@ def test_cert_constraint_subject_dn():
     from asn1crypto import x509
     scc = fields.SigCertConstraints(
         flags=fields.SigCertConstraintFlags.SUBJECT_DN,
-        subject_dn=x509.Name.build({'common_name': 'Lord Testerino'}),
+        subject_dn=x509.Name.build({'common_name': 'Alice'}),
     )
     scc.satisfied_by(FROM_CA.signing_cert, None)
     with pytest.raises(UnacceptableSignerError):
@@ -231,7 +231,7 @@ def test_cert_constraint_subject_dn():
     scc = fields.SigCertConstraints(
         flags=fields.SigCertConstraintFlags.SUBJECT_DN,
         subject_dn=x509.Name.build(
-            {'common_name': 'Lord Testerino', 'country_name': 'BE'}
+            {'common_name': 'Alice', 'country_name': 'BE'}
         )
     )
     scc.satisfied_by(FROM_CA.signing_cert, None)
@@ -336,7 +336,7 @@ def test_cert_constraint_composite(requests_mock):
         flags=fields.SigCertConstraintFlags.ISSUER | fields.SigCertConstraintFlags.SUBJECT_DN,
         issuers=[INTERM_CERT],
         subject_dn=x509.Name.build(
-            {'common_name': 'Lord Testerino', 'country_name': 'BE'}
+            {'common_name': 'Alice', 'country_name': 'BE'}
         )
     )
     scc.satisfied_by(FROM_CA.signing_cert, signer_validation_path)
@@ -387,9 +387,12 @@ def sign_with_sv(sv_spec, sig_meta, signer=FROM_CA, timestamper=DUMMY_TS, *,
     r = PdfFileReader(out)
     s = r.embedded_signatures[0]
     status = validate_pdf_signature(s, dummy_ocsp_vc())
+    summary = status.pretty_print_details()
     if test_violation:
+        assert 'not satisfy the SV constraints' in summary
         assert not status.seed_value_ok
     else:
+        assert 'no SV issues' in summary
         assert status.seed_value_ok
     return EmbeddedPdfSignature(r, s.sig_field, s.fq_name)
 
@@ -561,14 +564,14 @@ def test_sv_sign_cert_constraint():
     sv = fields.SigSeedValueSpec(
         cert=fields.SigCertConstraints(
             flags=fields.SigCertConstraintFlags.SUBJECT_DN,
-            subject_dn=x509.Name.build({'common_name': 'Lord Testerino'}),
+            subject_dn=x509.Name.build({'common_name': 'Alice'}),
         )
     )
     sign_with_sv(sv, signers.PdfSignatureMetadata(field_name='Sig'))
     sv = fields.SigSeedValueSpec(
         cert=fields.SigCertConstraints(
             flags=fields.SigCertConstraintFlags.SUBJECT_DN,
-            subject_dn=x509.Name.build({'common_name': 'Not Lord Testerino'}),
+            subject_dn=x509.Name.build({'common_name': 'Not Alice'}),
         )
     )
     with pytest.raises(SigningError):
